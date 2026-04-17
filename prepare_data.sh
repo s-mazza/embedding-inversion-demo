@@ -1,2 +1,13 @@
 #!/bin/bash
-python3 /workspace/prepare_data_fast.py "$@"
+
+# Stage 1: download 2M English samples from C4 (no GPU needed)
+python3 /workspace/prepare_data_fast.py \
+    --stage 1 \
+    --langs en \
+    --n-samples 2000000
+
+# Stage 2: tokenize + encode with jina-embeddings-v3 (GPU needed)
+python3 /workspace/prepare_data_fast.py \
+    --stage 2 \
+    --config /workspace/configs/v3_mmbert_jinav3.yaml \
+    --encode-batch 512

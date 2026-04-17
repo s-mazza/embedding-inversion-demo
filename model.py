@@ -211,7 +211,9 @@ class ConditionalMDLM(nn.Module):
             print("output_proj initialized from token embeddings (independent, trainable)")
         
         # RoPE position embeddings handled internally by ModernBert
-        
+        # rotary_emb handled internally by ModernBert
+        self.bert_config = mmbert.config
+        self.rotary_emb = mmbert.rotary_emb
         # Clean up
         del mmbert
         
@@ -243,8 +245,13 @@ class ConditionalMDLM(nn.Module):
         # Project conditioning
         cond = self.cond_proj(cond_embedding)  # [B, hidden]
         
+        position_ids = torch.arange(L, device=device).unsqueeze(0)
+
+        position_embeddings = {}
+        for layer_type in set(self.bert_config.layer_types):
+            position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
         # RoPE handled internally
-        position_embeddings = None
+        #position_embeddings = None
         
         # Apply transformer layers with AdaLN-Zero conditioning
         for layer in self.layers:
@@ -254,7 +261,8 @@ class ConditionalMDLM(nn.Module):
                     use_reentrant=False
                 )
             else:
-                hidden_states = layer(hidden_states, cond, position_embeddings)
+                layer_type = layer.pretrained_layer.attention_type
+                hidden_states = layer(hidden_states, cond, position_embeddings[layer_type])
         
         # Final norm with AdaLN-Zero
         hidden_states, _ = self.final_adaln(hidden_states, cond)
@@ -276,13 +284,19 @@ class ConditionalMDLM(nn.Module):
         
         # Project conditioning
         cond = self.cond_proj(cond_embedding)
-        
+
+        position_ids = torch.arange(L, device=device).unsqueeze(0)
+
+        position_embeddings = {}
+        for layer_type in set(self.bert_config.layer_types):
+            position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
         # RoPE handled internally
-        position_embeddings = None
+        #position_embeddings = None
         
         # Transformer layers
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cond, position_embeddings)
+            layer_type = layer.pretrained_layer.attention_type
+            hidden_states = layer(hidden_states, cond, position_embeddings[layer_type])
         
         # Final norm
         hidden_states, _ = self.final_adaln(hidden_states, cond)

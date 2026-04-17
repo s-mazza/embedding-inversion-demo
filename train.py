@@ -18,7 +18,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from safetensors.torch import save_file as safetensors_save
 
 from model import ConditionalMDLM, apply_mask
@@ -47,7 +47,7 @@ def find_batch_size(config, model, device):
             dummy_ids = torch.randint(0, mc["vocab_size"], (mid, mc["max_seq_len"]), device=device)
             dummy_emb = torch.randn(mid, mc["embedding_cond_dim"], device=device)
 
-            with autocast(dtype=torch.bfloat16):
+            with autocast('cuda', dtype=torch.bfloat16):
                 hidden = model.forward_hidden(dummy_ids, dummy_emb)
                 # Simulate exact chunked CE (same as training loop)
                 chunk_size = 256
@@ -153,7 +153,7 @@ def train(config, resume=False):
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"]
     )
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     # Gradient accumulation
     grad_accum = tc.get("grad_accum", 1)
@@ -236,7 +236,7 @@ def train(config, resume=False):
                 pg["lr"] = lr
             optimizer.zero_grad()
 
-        with autocast(dtype=torch.bfloat16):
+        with autocast('cuda', dtype=torch.bfloat16):
             # Get hidden states instead of full logits to save memory
             hidden = model.forward_hidden(masked_ids, embedding, padding_mask)
 
@@ -326,7 +326,7 @@ def train(config, resume=False):
                     vpad = vb["padding_mask"].to(device)
                     vm_ids, vm_mask, _ = apply_mask(vids, mask_token_id, vpad)
 
-                    with autocast(dtype=torch.bfloat16):
+                    with autocast('cuda', dtype=torch.bfloat16):
                         vhidden = ema_model.forward_hidden(vm_ids, vemb, vpad)
                         # Chunked CE for validation (avoid OOM)
                         vh_flat = vhidden.view(-1, vhidden.shape[-1])

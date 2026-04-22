@@ -10,7 +10,7 @@ model:
   dropout: 0.0
   embedding_cond_dim: 1024    # jina-embeddings-v3 output dim
   mask_token_id: 256000       # vocab_size - 1
-  encoder_model: jinaai/jina-embeddings-v3-hf
+  encoder_model: jinaai/jina-embeddings-v3
   decoder_tokenizer: jhu-clsp/mmBERT-base
   pretrained_token_embeddings: jhu-clsp/mmBERT-base
   freeze_token_embeddings: true

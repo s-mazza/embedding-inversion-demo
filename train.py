@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from safetensors.torch import save_file as safetensors_save
+from safetensors.torch import save_model as safetensors_save_model
 
 from model import ConditionalMDLM, apply_mask
 from dataset import create_dataloaders
@@ -113,7 +113,7 @@ def save_checkpoint(path, step, best_val_loss, model, ema_model, optimizer, scal
 def save_ema(path, step, best_val_loss, ema_model, config):
     """Save inference-only EMA weights as safetensors with metadata."""
     st_path = path.replace(".pt", ".safetensors")
-    safetensors_save(ema_model.state_dict(), st_path, metadata=_meta(step, best_val_loss, config))
+    safetensors_save_model(ema_model, st_path, metadata=_meta(step, best_val_loss, config))
 
 
 def train(config, resume=False):

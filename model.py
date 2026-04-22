@@ -96,14 +96,17 @@ class ModernBertLayerWithAdaLN(nn.Module):
         else:
             # Use pretrained norm but apply AdaLN conditioning
             normed_attn = self.attn_norm(hidden_states) * (1 + scale_attn) + shift_attn
-        
+
+        B, L, _ = hidden_states.shape
+        position_ids = torch.arange(L, device=hidden_states.device).unsqueeze(0).expand(B, -1)
+
         # Attention (returns tuple (output, attention_weights) but we only need output)
         attn_out = self.pretrained_layer.attn(
             normed_attn,
             attention_mask=None,
             sliding_window_mask=None,
-            position_ids=None,
-            position_embeddings=position_embeddings
+            position_ids=position_ids,
+            position_embeddings=None,
         )
         # attn might return a tuple, take first element
         attn_output = attn_out[0] if isinstance(attn_out, tuple) else attn_out

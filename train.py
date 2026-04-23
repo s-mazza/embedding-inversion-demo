@@ -358,7 +358,7 @@ def train(config, resume=False):
             val_count = 0
             with torch.no_grad():
                 for i, vb in enumerate(val_loader):
-                    if i >= 20:  # 20 batches for speed
+                    if i >= 50:  # 50 batches = 5000 samples (lower noise)
                         break
                     vids = vb["token_ids"].to(device)
                     vemb = vb["embedding"].to(device)

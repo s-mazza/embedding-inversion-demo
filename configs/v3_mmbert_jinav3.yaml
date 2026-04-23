@@ -30,7 +30,7 @@ training:
   num_workers: 4
   mixed_precision: true
   ema_decay: 0.9999
-  early_stop_patience: 5000
+  early_stop_patience: 15000
 
 data:
   data_dir: data_mmbert_jinav3

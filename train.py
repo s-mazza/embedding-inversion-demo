@@ -14,11 +14,14 @@ import json
 import yaml
 import math
 import copy
+import contextlib
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from safetensors.torch import save_model as safetensors_save_model
 
 from model import ConditionalMDLM, apply_mask
@@ -117,10 +120,20 @@ def save_ema(path, step, best_val_loss, ema_model, config):
 
 
 def train(config, resume=False):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}", flush=True)
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name()}", flush=True)
+    # Distributed setup
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_dist = world_size > 1
+    is_main = local_rank == 0
+
+    if is_dist:
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if is_main:
+        print(f"Device: {device} | World size: {world_size}", flush=True)
+        print(f"GPU: {torch.cuda.get_device_name(local_rank)}", flush=True)
 
     mc = config["model"]
     tc = config["training"]
@@ -128,26 +141,31 @@ def train(config, resume=False):
     # Build model
     model = ConditionalMDLM(config).to(device)
     total_params, trainable_params = model.count_params()
-    print(f"Model params: {total_params:,} total, {trainable_params:,} trainable", flush=True)
+    if is_main:
+        print(f"Model params: {total_params:,} total, {trainable_params:,} trainable", flush=True)
 
-    # EMA model
+    # EMA model (only on main rank, others don't save/use it)
     ema_decay = tc.get("ema_decay", 0.9999)
     ema_model = copy.deepcopy(model)
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
-    print(f"EMA decay: {ema_decay}", flush=True)
+    if is_main:
+        print(f"EMA decay: {ema_decay}", flush=True)
 
     # Batch size: use config value directly (auto-tune unreliable with chunked CE)
     batch_size = tc.get("batch_size", 128)
     tc["batch_size"] = batch_size
-    print(f"Using batch size: {batch_size}", flush=True)
+    if is_main:
+        print(f"Using batch size: {batch_size}", flush=True)
 
     # Data
-    print("Loading data...", flush=True)
-    train_loader, val_loader = create_dataloaders(config)
-    print(f"Train: {len(train_loader.dataset):,} samples, {len(train_loader)} batches", flush=True)
-    print(f"Val: {len(val_loader.dataset):,} samples", flush=True)
+    if is_main:
+        print("Loading data...", flush=True)
+    train_loader, val_loader, train_sampler = create_dataloaders(config, rank=local_rank, world_size=world_size)
+    if is_main:
+        print(f"Train: {len(train_loader.dataset):,} samples, {len(train_loader)} batches", flush=True)
+        print(f"Val: {len(val_loader.dataset):,} samples", flush=True)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -157,8 +175,9 @@ def train(config, resume=False):
 
     # Gradient accumulation
     grad_accum = tc.get("grad_accum", 1)
-    effective_batch = batch_size * grad_accum
-    print(f"Effective batch size: {effective_batch} (micro={batch_size} x accum={grad_accum})", flush=True)
+    effective_batch = batch_size * grad_accum * world_size
+    if is_main:
+        print(f"Effective batch size: {effective_batch} (micro={batch_size} x accum={grad_accum} x {world_size} GPUs)", flush=True)
 
     # Resume
     start_step = 0
@@ -171,21 +190,29 @@ def train(config, resume=False):
         if not os.path.exists(ckpt_path):
             ckpt_path = f"{ckpt_dir}/best.pt"  # fallback
         if os.path.exists(ckpt_path):
-            print(f"Resuming from {ckpt_path}...", flush=True)
+            if is_main:
+                print(f"Resuming from {ckpt_path}...", flush=True)
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             state_dict = ckpt["model"]
-            # Strip _orig_mod prefix if present (from compiled checkpoints)
-            clean_sd = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+            # Strip _orig_mod (compiled) and module. (DDP) prefixes
+            clean_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in state_dict.items()}
             model.load_state_dict(clean_sd)
             optimizer.load_state_dict(ckpt["optimizer"])
             scaler.load_state_dict(ckpt["scaler"])
             start_step = ckpt["step"]
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             if "ema_model" in ckpt:
-                ema_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["ema_model"].items()}
+                ema_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in ckpt["ema_model"].items()}
                 ema_model.load_state_dict(ema_sd)
-                print("Loaded EMA weights", flush=True)
-            print(f"Resumed at step {start_step}", flush=True)
+                if is_main:
+                    print("Loaded EMA weights", flush=True)
+            if is_main:
+                print(f"Resumed at step {start_step}", flush=True)
+
+    # Wrap with DDP after loading checkpoint (avoids module. prefix issues)
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank])
+    raw_model = model.module if is_dist else model
 
     # Training loop
     model.train()
@@ -209,7 +236,8 @@ def train(config, resume=False):
     data_iter = iter(train_loader)
     epoch = 0
 
-    print(f"\n=== Training started (step {step}/{max_steps}) ===", flush=True)
+    if is_main:
+        print(f"\n=== Training started (step {step}/{max_steps}) ===", flush=True)
 
     while step < max_steps:
         # Get batch (restart iterator if needed)
@@ -217,7 +245,10 @@ def train(config, resume=False):
             batch = next(data_iter)
         except StopIteration:
             epoch += 1
-            print(f"--- Epoch {epoch} complete (step {step}) ---", flush=True)
+            if is_dist and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if is_main:
+                print(f"--- Epoch {epoch} complete (step {step}) ---", flush=True)
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -273,7 +304,10 @@ def train(config, resume=False):
             loss = loss * loss_weight
             loss = loss / grad_accum  # scale for accumulation
 
-        scaler.scale(loss).backward()
+        # no_sync skips all-reduce on non-final micro-steps (reduces NCCL overhead)
+        sync_ctx = model.no_sync() if (is_dist and micro_step < grad_accum - 1) else contextlib.nullcontext()
+        with sync_ctx:
+            scaler.scale(loss).backward()
 
         running_loss += loss.item() * grad_accum
         running_acc += total_correct / max(total_masked, 1)
@@ -287,17 +321,17 @@ def train(config, resume=False):
         # Optimizer step after accumulation
         micro_step = 0
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), tc["max_grad_norm"])
+        nn.utils.clip_grad_norm_(raw_model.parameters(), tc["max_grad_norm"])
         scaler.step(optimizer)
         scaler.update()
-        # EMA update
+        # EMA update (use raw_model to access underlying params without DDP wrapper)
         with torch.no_grad():
-            for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                ep.mul_(ema_decay).add_(mp, alpha=1 - ema_decay)
+            for ep, mp in zip(ema_model.parameters(), raw_model.parameters()):
+                ep.lerp_(mp, 1 - ema_decay)
         step += 1
 
-        # Log
-        if step % log_every == 0:
+        # Log (rank 0 only)
+        if is_main and step % log_every == 0:
             avg_loss = running_loss / running_count
             avg_acc = running_acc / running_count
             global_elapsed = time.time() - t0_global
@@ -312,8 +346,8 @@ def train(config, resume=False):
             running_acc = 0.0
             running_count = 0
 
-        # Validation & save best
-        if step % eval_every == 0:
+        # Validation & save best (rank 0 only)
+        if is_main and step % eval_every == 0:
             ema_model.eval()
             val_loss = 0.0
             val_count = 0
@@ -349,7 +383,7 @@ def train(config, resume=False):
 
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
-                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, model, ema_model, optimizer, scaler, config)
+                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/best_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved best.pt + best_ema.pt (step {step}, val_loss {avg_val:.4f})", flush=True)
                 best_step = step
@@ -357,30 +391,34 @@ def train(config, resume=False):
             # Early stopping check
             if step - best_step >= early_stop_patience and step > early_stop_patience:
                 print(f"\n=== Early stopping: no improvement for {step - best_step} steps (patience={early_stop_patience}) ===", flush=True)
-                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, model, ema_model, optimizer, scaler, config)
+                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
+                if is_dist:
+                    dist.destroy_process_group()
                 return
 
             # Save latest for resume
-            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, model, ema_model, optimizer, scaler, config)
+            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
 
             # Save milestone checkpoints for paper experiments
             milestones = {10000, 25000, 50000, 100000, 200000}
             if step in milestones:
                 mpath = f"{ckpt_dir}/step_{step}.pt"
-                save_checkpoint(mpath, step, best_val_loss, model, ema_model, optimizer, scaler, config)
+                save_checkpoint(mpath, step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/step_{step}_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved milestone: {mpath} + ema", flush=True)
 
             model.train()
 
-    print(f"\n=== Training complete ({step} steps) ===", flush=True)
+    if is_main:
+        print(f"\n=== Training complete ({step} steps) ===", flush=True)
+        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+        save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
+        print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f})", flush=True)
 
-    # Save final
-    save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, model, ema_model, optimizer, scaler, config)
-    save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
-    print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f})", flush=True)
+    if is_dist:
+        dist.destroy_process_group()
 
 
 def main():

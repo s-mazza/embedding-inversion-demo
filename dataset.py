@@ -10,6 +10,7 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 
 class EmbeddingInversionDataset(Dataset):
@@ -87,7 +88,7 @@ class EmbeddingInversionDataset(Dataset):
         }
 
 
-def create_dataloaders(config):
+def create_dataloaders(config, rank=0, world_size=1):
     dc = config["data"]
     tc = config["training"]
     mc = config["model"]
@@ -113,13 +114,19 @@ def create_dataloaders(config):
         pad_token_id=pad_id, bos_token_id=bos_id
     )
 
+    is_dist = world_size > 1
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if is_dist else None
+    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if is_dist else None
+
     train_loader = DataLoader(
-        train_ds, batch_size=tc["batch_size"], shuffle=True,
+        train_ds, batch_size=tc["batch_size"],
+        sampler=train_sampler, shuffle=(not is_dist),
         num_workers=tc["num_workers"], pin_memory=True, drop_last=True
     )
     val_loader = DataLoader(
-        val_ds, batch_size=tc["batch_size"], shuffle=False,
+        val_ds, batch_size=tc["batch_size"],
+        sampler=val_sampler, shuffle=False,
         num_workers=tc["num_workers"], pin_memory=True
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, train_sampler

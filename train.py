@@ -27,6 +27,8 @@ from safetensors.torch import save_model as safetensors_save_model
 from model import ConditionalMDLM, apply_mask
 from dataset import create_dataloaders
 
+torch.set_float32_matmul_precision('high')  # TF32 on Ampere (~8% faster matmul)
+
 
 def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.0):
     """Cosine schedule with warmup."""
@@ -255,9 +257,9 @@ def train(config, resume=False):
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
-        token_ids = batch["token_ids"].to(device)
-        embedding = batch["embedding"].to(device)
-        padding_mask = batch["padding_mask"].to(device)
+        token_ids = batch["token_ids"].to(device, non_blocking=True)
+        embedding = batch["embedding"].to(device, non_blocking=True)
+        padding_mask = batch["padding_mask"].to(device, non_blocking=True)
 
         # Apply random masking
         masked_ids, target_mask, mask_ratio = apply_mask(token_ids, mask_token_id, padding_mask)
@@ -268,7 +270,7 @@ def train(config, resume=False):
             lr = get_lr(step, tc["warmup_steps"], max_steps, tc["lr"], min_lr_ratio)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         with autocast('cuda', dtype=torch.bfloat16):
             # Get hidden states instead of full logits to save memory

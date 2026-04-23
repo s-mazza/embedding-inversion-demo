@@ -121,12 +121,14 @@ def create_dataloaders(config, rank=0, world_size=1):
     train_loader = DataLoader(
         train_ds, batch_size=tc["batch_size"],
         sampler=train_sampler, shuffle=(not is_dist),
-        num_workers=tc["num_workers"], pin_memory=True, drop_last=True
+        num_workers=tc["num_workers"], pin_memory=True, drop_last=True,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=tc["batch_size"],
         sampler=val_sampler, shuffle=False,
-        num_workers=tc["num_workers"], pin_memory=True
+        num_workers=tc["num_workers"], pin_memory=True,
+        persistent_workers=True
     )
 
     return train_loader, val_loader, train_sampler

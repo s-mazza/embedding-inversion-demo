@@ -289,7 +289,7 @@ def train(config, resume=False):
                 m_chunk = mask_flat[i:end]  # [chunk]
 
                 # Compute logits only for this chunk (memory efficient)
-                w = model.output_proj.weight  # [vocab, hidden] - tied with token_embed
+                w = raw_model.output_proj.weight  # [vocab, hidden]
                 logits_chunk = F.linear(h_chunk, w)  # [chunk, vocab]
                 loss_chunk = F.cross_entropy(logits_chunk, t_chunk, reduction="none")
                 total_loss = total_loss + (loss_chunk * m_chunk).sum()

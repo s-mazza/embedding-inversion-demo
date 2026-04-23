@@ -9,6 +9,6 @@ docker run \
     --rm \
     --gpus all \
     emb-inversion \
-    python3 /workspace/eval_quality.py \
+    python3 /workspace/${EVAL_SCRIPT:-eval_quality.py} \
         --checkpoint /workspace/checkpoints_v3_mmbert_jinav3/best.pt \
         "$@"

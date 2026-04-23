@@ -213,7 +213,8 @@ def train(config, resume=False):
 
     # Wrap with DDP after loading checkpoint (avoids module. prefix issues)
     if is_dist:
-        model = DDP(model, device_ids=[local_rank])
+        # gradient_as_bucket_view: gradients ARE the buckets (no extra copy ~100-200MB saved)
+        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
     raw_model = model.module if is_dist else model
 
     # Training loop

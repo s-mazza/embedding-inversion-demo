@@ -7,7 +7,7 @@ docker run \
     -v "$LLM_CACHE_DIR":/llms \
     -e HF_HOME="/llms" \
     --rm \
-    --gpus '"device=0"' \
+    --gpus all \
     emb-inversion \
     python3 /workspace/eval_quality.py \
         --checkpoint /workspace/checkpoints_v3_mmbert_jinav3/best.pt \

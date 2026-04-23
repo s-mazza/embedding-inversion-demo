@@ -144,14 +144,14 @@ def train(config, resume=False):
     if is_main:
         print(f"Model params: {total_params:,} total, {trainable_params:,} trainable", flush=True)
 
-    # EMA model (only on main rank, others don't save/use it)
+    # EMA model in bf16 to save ~1.2 GB VRAM per GPU (sufficient for inference)
     ema_decay = tc.get("ema_decay", 0.9999)
-    ema_model = copy.deepcopy(model)
+    ema_model = copy.deepcopy(model).bfloat16()
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
     if is_main:
-        print(f"EMA decay: {ema_decay}", flush=True)
+        print(f"EMA decay: {ema_decay} (bf16)", flush=True)
 
     # Batch size: use config value directly (auto-tune unreliable with chunked CE)
     batch_size = tc.get("batch_size", 128)
@@ -203,9 +203,11 @@ def train(config, resume=False):
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             if "ema_model" in ckpt:
                 ema_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in ckpt["ema_model"].items()}
+                # cast to bf16 to match ema_model dtype (checkpoint may be fp32)
+                ema_sd = {k: v.bfloat16() for k, v in ema_sd.items()}
                 ema_model.load_state_dict(ema_sd)
                 if is_main:
-                    print("Loaded EMA weights", flush=True)
+                    print("Loaded EMA weights (bf16)", flush=True)
             if is_main:
                 print(f"Resumed at step {start_step}", flush=True)
 
@@ -324,10 +326,10 @@ def train(config, resume=False):
         nn.utils.clip_grad_norm_(raw_model.parameters(), tc["max_grad_norm"])
         scaler.step(optimizer)
         scaler.update()
-        # EMA update (use raw_model to access underlying params without DDP wrapper)
+        # EMA update: ep is bf16, mp is fp32 — cast mp before lerp
         with torch.no_grad():
             for ep, mp in zip(ema_model.parameters(), raw_model.parameters()):
-                ep.lerp_(mp, 1 - ema_decay)
+                ep.lerp_(mp.bfloat16(), 1 - ema_decay)
         step += 1
 
         # Log (rank 0 only)

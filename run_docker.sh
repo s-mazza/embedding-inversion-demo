@@ -8,6 +8,7 @@ docker run \
     -v "$LLM_CACHE_DIR":/llms \
     -e HF_HOME="/llms" \
     -e NUM_GPUS=$NUM_GPUS \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     --rm \
     --memory="60g" \
     --ipc=host \

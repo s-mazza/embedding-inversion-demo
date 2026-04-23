@@ -269,7 +269,7 @@ def train(config, resume=False):
 
         with autocast('cuda', dtype=torch.bfloat16):
             # Get hidden states instead of full logits to save memory
-            hidden = model.forward_hidden(masked_ids, embedding, padding_mask)
+            hidden = raw_model.forward_hidden(masked_ids, embedding, padding_mask)
 
             # Chunked cross-entropy: compute loss without materializing full [B*32, 250K] logits
             chunk_size = 256  # positions per chunk

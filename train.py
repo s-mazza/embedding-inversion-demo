@@ -30,13 +30,29 @@ from dataset import create_dataloaders
 torch.set_float32_matmul_precision('high')  # TF32 on Ampere (~8% faster matmul)
 
 
-def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.0):
-    """Cosine schedule with warmup."""
-    if step < warmup_steps:
-        return max_lr * step / warmup_steps
-    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.0,
+           warmdown_start_step=None, warmdown_steps=None):
+    """Cosine schedule with warmup, plus optional explicit warmdown phase.
+
+    If warmdown_start_step/warmdown_steps are set and step >= warmdown_start_step,
+    the LR decays from whatever the cosine schedule produced at warmdown_start_step
+    down to min_lr over warmdown_steps steps, regardless of max_steps.
+    This decouples the warmdown from the original schedule length.
+    """
     min_lr = max_lr * min_lr_ratio
-    return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def _cosine(s):
+        if s < warmup_steps:
+            return max_lr * s / warmup_steps
+        progress = (s - warmup_steps) / max(1, max_steps - warmup_steps)
+        return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    if warmdown_start_step is not None and warmdown_steps is not None and step >= warmdown_start_step:
+        lr_at_start = _cosine(warmdown_start_step)
+        progress = min(1.0, (step - warmdown_start_step) / max(1, warmdown_steps))
+        return min_lr + (lr_at_start - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return _cosine(step)
 
 
 def find_batch_size(config, model, device):
@@ -102,11 +118,12 @@ def _meta(step, best_val_loss, config):
     }
 
 
-def save_checkpoint(path, step, best_val_loss, model, ema_model, optimizer, scaler, config):
+def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, scaler, config):
     """Save full checkpoint for resuming training (.pt, includes optimizer state)."""
     torch.save({
         "step": step,
         "best_val_loss": best_val_loss,
+        "best_step": best_step,
         "model": model.state_dict(),
         "ema_model": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -183,6 +200,7 @@ def train(config, resume=False):
 
     # Resume
     start_step = 0
+    loaded_best_step = 0
     ckpt_dir = config.get("_ckpt_dir", "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Checkpoint dir: {ckpt_dir}", flush=True)
@@ -203,6 +221,7 @@ def train(config, resume=False):
             scaler.load_state_dict(ckpt["scaler"])
             start_step = ckpt["step"]
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            loaded_best_step = ckpt.get("best_step", start_step)
             if "ema_model" in ckpt:
                 ema_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in ckpt["ema_model"].items()}
                 # cast to bf16 to match ema_model dtype (checkpoint may be fp32)
@@ -211,7 +230,7 @@ def train(config, resume=False):
                 if is_main:
                     print("Loaded EMA weights (bf16)", flush=True)
             if is_main:
-                print(f"Resumed at step {start_step}", flush=True)
+                print(f"Resumed at step {start_step} (best_step={loaded_best_step}, best_val_loss={best_val_loss:.4f})", flush=True)
 
     # Wrap with DDP after loading checkpoint (avoids module. prefix issues)
     if is_dist:
@@ -230,7 +249,9 @@ def train(config, resume=False):
         best_val_loss = float("inf")
     eval_every = tc.get("eval_every", 500)
     early_stop_patience = tc.get("early_stop_patience", 5000)
-    best_step = start_step  # step when best_val_loss was last improved
+    warmdown_start_step = tc.get("warmdown_start_step", None)
+    warmdown_steps = tc.get("warmdown_steps", None)
+    best_step = loaded_best_step if loaded_best_step > 0 else start_step
     running_loss = 0.0
     running_acc = 0.0
     running_count = 0
@@ -267,7 +288,8 @@ def train(config, resume=False):
         # Forward
         if micro_step == 0:
             min_lr_ratio = tc.get("min_lr_ratio", 0.0)
-            lr = get_lr(step, tc["warmup_steps"], max_steps, tc["lr"], min_lr_ratio)
+            lr = get_lr(step, tc["warmup_steps"], max_steps, tc["lr"], min_lr_ratio,
+                        warmdown_start_step, warmdown_steps)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
             optimizer.zero_grad(set_to_none=True)
@@ -388,15 +410,15 @@ def train(config, resume=False):
 
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
-                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+                best_step = step
+                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/best_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved best.pt + best_ema.pt (step {step}, val_loss {avg_val:.4f})", flush=True)
-                best_step = step
 
             # Early stopping check
             if step - best_step >= early_stop_patience and step > early_stop_patience:
                 print(f"\n=== Early stopping: no improvement for {step - best_step} steps (patience={early_stop_patience}) ===", flush=True)
-                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
                 if is_dist:
@@ -404,13 +426,13 @@ def train(config, resume=False):
                 return
 
             # Save latest for resume
-            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
 
             # Save milestone checkpoints for paper experiments
             milestones = {10000, 25000, 50000, 100000, 200000}
             if step in milestones:
                 mpath = f"{ckpt_dir}/step_{step}.pt"
-                save_checkpoint(mpath, step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+                save_checkpoint(mpath, step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
                 save_ema(f"{ckpt_dir}/step_{step}_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved milestone: {mpath} + ema", flush=True)
 
@@ -418,9 +440,9 @@ def train(config, resume=False):
 
     if is_main:
         print(f"\n=== Training complete ({step} steps) ===", flush=True)
-        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, raw_model, ema_model, optimizer, scaler, config)
+        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
         save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
-        print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f})", flush=True)
+        print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
 
     if is_dist:
         dist.destroy_process_group()

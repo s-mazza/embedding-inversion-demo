@@ -31,6 +31,8 @@ training:
   mixed_precision: true
   ema_decay: 0.9999
   early_stop_patience: 15000
+  warmdown_start_step: 18500
+  warmdown_steps: 15000
 
 data:
   data_dir: data_mmbert_jinav3

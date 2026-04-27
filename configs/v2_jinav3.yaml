@@ -10,10 +10,11 @@ model:
   mask_token_id: 250001
   encoder_model: jinaai/jina-embeddings-v3
   decoder_tokenizer: xlm-roberta-base
+  tie_weights: true             # paper: "input and output embeddings are weight-tied"
 
 training:
   batch_size: 400
-  grad_accum: 4
+  grad_accum: 2          # 2 GPUs x 2 accum x 400 batch = 1600 effective (matches paper)
   max_steps: 200000
   lr: 0.0001
   min_lr_ratio: 0.1
@@ -25,6 +26,7 @@ training:
   num_workers: 4
   mixed_precision: true
   ema_decay: 0.9999
+  early_stop_patience: 15000
 
 data:
   data_dir: data_jinav3

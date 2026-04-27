@@ -1,8 +1,14 @@
 """
 Conditional Masked Diffusion Language Model (CMDLM) for embedding inversion.
 
-Architecture: mmBERT backbone with AdaLN-Zero conditioning on jina-embeddings-v3 vectors.
-Input: masked token sequence [B, L] + embedding condition [B, 1024]
+Two architectures supported via config:
+  - From-scratch (v2): 8-layer custom transformer, no pretrained backbone.
+    Activated when 'pretrained_token_embeddings' is absent from config.
+    State-dict compatible with demo_server.py.
+  - mmBERT (v3): pretrained 22-layer ModernBERT backbone with AdaLN-Zero.
+    Activated when 'pretrained_token_embeddings' is set in config.
+
+Input: masked token sequence [B, L] + embedding condition [B, cond_dim]
 Output: logits [B, L, V] predicting original tokens at all positions
 """
 
@@ -12,6 +18,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+
+# ---------------------------------------------------------------------------
+# From-scratch architecture (v2) — demo_server.py compatible
+# ---------------------------------------------------------------------------
+
+class AdaLN(nn.Module):
+    """Adaptive LayerNorm for from-scratch architecture (scale + shift, no gate)."""
+
+    def __init__(self, hidden_dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
+
+    def forward(self, x, cond):
+        params = self.proj(cond).unsqueeze(1)
+        scale, shift = params.chunk(2, dim=-1)
+        return self.norm(x) * (1 + scale) + shift
+
+
+class TransformerBlock(nn.Module):
+    """Standard transformer block with AdaLN conditioning (v2 from-scratch)."""
+
+    def __init__(self, hidden_dim, num_heads, ff_dim, dropout=0.0):
+        super().__init__()
+        self.adaln1 = AdaLN(hidden_dim, hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.adaln2 = AdaLN(hidden_dim, hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, hidden_dim),
+        )
+
+    def forward(self, x, cond):
+        normed = self.adaln1(x, cond)
+        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+        x = x + attn_out
+        normed = self.adaln2(x, cond)
+        x = x + self.ff(normed)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# mmBERT architecture (v3) — pretrained backbone with AdaLN-Zero
+# ---------------------------------------------------------------------------
 
 class AdaLNZero(nn.Module):
     """
@@ -129,10 +181,10 @@ class ModernBertLayerWithAdaLN(nn.Module):
 
 class ConditionalMDLM(nn.Module):
     """
-    Conditional Masked Diffusion Language Model with mmBERT backbone.
+    Conditional Masked Diffusion Language Model for embedding inversion.
 
-    Takes masked token sequences and a conditioning embedding vector,
-    predicts the original tokens at all positions.
+    Dispatches to from-scratch (v2) or mmBERT (v3) architecture based on
+    whether 'pretrained_token_embeddings' is present in the model config.
     """
 
     def __init__(self, config):
@@ -145,13 +197,44 @@ class ConditionalMDLM(nn.Module):
         self.max_seq_len = mc["max_seq_len"]
         self.mask_token_id = mc["mask_token_id"]
 
-        # Load pretrained mmBERT model
         pretrained_model = mc.get("pretrained_token_embeddings")
-        if not pretrained_model:
-            raise ValueError("pretrained_token_embeddings must be specified (e.g., jhu-clsp/mmBERT-base)")
+        self._from_scratch = not bool(pretrained_model)
+
+        if self._from_scratch:
+            self._init_scratch(mc)
+        else:
+            self._init_mmbert(mc, pretrained_model)
+
+        total, trainable = self.count_params()
+        print(f"Total params: {total:,} | Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
+
+    def _init_scratch(self, mc):
+        """8-layer from-scratch architecture — state-dict compatible with demo_server.py."""
+        self.token_embed = nn.Embedding(self.vocab_size, self.hidden_dim)
+        self.pos_embed = nn.Embedding(self.max_seq_len, self.hidden_dim)
+        cond_dim = mc["embedding_cond_dim"]
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.blocks = nn.ModuleList([
+            TransformerBlock(self.hidden_dim, mc["num_heads"], mc["ff_dim"], mc.get("dropout", 0.0))
+            for _ in range(mc["num_layers"])
+        ])
+        self.final_norm = AdaLN(self.hidden_dim, self.hidden_dim)
+        self.output_proj = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
+        if mc.get("tie_weights", False):
+            self.output_proj.weight = self.token_embed.weight
+            print("Weight tying: output_proj shares token_embed (saves 192M params)")
+        print(f"From-scratch: {mc['num_layers']} layers, hidden={self.hidden_dim}, vocab={self.vocab_size}")
+
+    def _init_mmbert(self, mc, pretrained_model):
+        """22-layer mmBERT backbone with AdaLN-Zero conditioning."""
+        # Load pretrained mmBERT model
         
         print(f"Loading pretrained mmBERT from {pretrained_model}...")
-        from transformers import AutoModel
+        from transformers import AutoModel  # noqa: PLC0415
         mmbert = AutoModel.from_pretrained(pretrained_model, trust_remote_code=True)
         
         # Extract components
@@ -219,36 +302,36 @@ class ConditionalMDLM(nn.Module):
         
         # Gradient checkpointing (disabled by default)
         self.use_checkpoint = False
-        
-        # Count parameters
-        total, trainable = self.count_params()
-        print(f"Total params: {total:,} | Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
 
     def forward(self, input_ids, cond_embedding, padding_mask=None):
         """
         Args:
-            input_ids: [B, L] token ids (with some positions replaced by mask_token_id)
-            cond_embedding: [B, 1024] target embedding vector
-            padding_mask: [B, L] True where padding (to be ignored)
-
+            input_ids: [B, L] token ids (with some masked by mask_token_id)
+            cond_embedding: [B, cond_dim] target embedding vector
+            padding_mask: [B, L] True where padding (mmBERT path only)
         Returns:
-            logits: [B, L, V] prediction logits for all positions
+            logits: [B, L, V]
         """
-        B, L = input_ids.shape
-        device = input_ids.device
+        if self._from_scratch:
+            return self._forward_scratch(input_ids, cond_embedding)
+        return self._forward_mmbert(input_ids, cond_embedding, padding_mask)
 
-        # Token embeddings
-        hidden_states = self.token_embed(input_ids)  # [B, L, hidden]
+    def _forward_scratch(self, input_ids, cond_embedding):
+        B, L = input_ids.shape
+        positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
+        x = self.token_embed(input_ids) + self.pos_embed(positions)
+        cond = self.cond_proj(cond_embedding)
+        for block in self.blocks:
+            x = block(x, cond)
+        x = self.final_norm(x, cond)
+        return self.output_proj(x)
+
+    def _forward_mmbert(self, input_ids, cond_embedding, padding_mask=None):
+        hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
         hidden_states = self.embed_drop(hidden_states)
-        
-        # Project conditioning
-        cond = self.cond_proj(cond_embedding)  # [B, hidden]
-        
-        # RoPE handled internally by ModernBert
+        cond = self.cond_proj(cond_embedding)
         position_embeddings = None
-
-        # Apply transformer layers with AdaLN-Zero conditioning
         for layer in self.layers:
             if self.use_checkpoint and self.training:
                 hidden_states = torch_checkpoint(
@@ -257,39 +340,19 @@ class ConditionalMDLM(nn.Module):
                 )
             else:
                 hidden_states = layer(hidden_states, cond, position_embeddings)
-        
-        # Final norm with AdaLN-Zero
         hidden_states, _ = self.final_adaln(hidden_states, cond)
-        
-        # Output projection
-        logits = self.output_proj(hidden_states)  # [B, L, V]
-
-        return logits
+        return self.output_proj(hidden_states)
 
     def forward_hidden(self, input_ids, cond_embedding, padding_mask=None):
-        """Same as forward but returns hidden states before output_proj."""
-        B, L = input_ids.shape
-        device = input_ids.device
-
-        # Token embeddings
+        """Returns hidden states before output_proj (mmBERT path only)."""
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
         hidden_states = self.embed_drop(hidden_states)
-        
-        # Project conditioning
         cond = self.cond_proj(cond_embedding)
-
-        # RoPE handled internally by ModernBert
-        position_embeddings = None
-
-        # Transformer layers
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cond, position_embeddings)
-        
-        # Final norm
+            hidden_states = layer(hidden_states, cond, None)
         hidden_states, _ = self.final_adaln(hidden_states, cond)
-        
-        return hidden_states  # [B, L, hidden]
+        return hidden_states
 
     def count_params(self):
         total = sum(p.numel() for p in self.parameters())

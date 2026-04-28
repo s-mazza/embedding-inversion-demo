@@ -344,7 +344,15 @@ class ConditionalMDLM(nn.Module):
         return self.output_proj(hidden_states)
 
     def forward_hidden(self, input_ids, cond_embedding, padding_mask=None):
-        """Returns hidden states before output_proj (mmBERT path only)."""
+        """Returns hidden states before output_proj."""
+        if self._from_scratch:
+            B, L = input_ids.shape
+            positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
+            x = self.token_embed(input_ids) + self.pos_embed(positions)
+            cond = self.cond_proj(cond_embedding)
+            for block in self.blocks:
+                x = block(x, cond)
+            return self.final_norm(x, cond)
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
         hidden_states = self.embed_drop(hidden_states)

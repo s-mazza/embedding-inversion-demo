@@ -85,18 +85,13 @@ send "🤖 Monitor started.
 • Job 11078393 (1-GPU backup, 7d)
 Updates: job state changes, new best model, errors, every ${MILESTONE_INTERVAL} steps."
 
-# Start log monitors in background (they wait for log files themselves)
-for entry in "${JOBS[@]}"; do
-    IFS=':' read -r job_id gpus log_name <<< "$entry"
-    monitor_log "$LOG_DIR/$log_name" "${gpus}-GPU #${job_id}" &
-done
-
-# Main loop: poll job states
+# Main loop: poll job states, start log monitor when job transitions to RUNNING
 while true; do
     for entry in "${JOBS[@]}"; do
         IFS=':' read -r job_id gpus log_name <<< "$entry"
         label="${gpus}-GPU #${job_id}"
         state_file="$STATE_DIR/state_$job_id"
+        log_started_file="$STATE_DIR/log_started_$job_id"
 
         new_state=$(squeue -j "$job_id" --format="%T" --noheader 2>/dev/null | tr -d ' ')
         old_state=$(cat "$state_file" 2>/dev/null)
@@ -109,6 +104,12 @@ while true; do
         elif [ -n "$new_state" ] && [ "$new_state" != "$old_state" ]; then
             echo "$new_state" > "$state_file"
             send "🔄 [$label] $old_state → $new_state"
+
+            # Start log monitor only when job becomes RUNNING
+            if [ "$new_state" = "RUNNING" ] && [ ! -f "$log_started_file" ]; then
+                touch "$log_started_file"
+                monitor_log "$LOG_DIR/$log_name" "$label" &
+            fi
         fi
     done
     sleep 60

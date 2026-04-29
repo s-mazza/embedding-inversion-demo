@@ -8,7 +8,7 @@ docker run \
     -v "$LLM_CACHE_DIR":/llms \
     -e HF_HOME="/llms" \
     -e NUM_GPUS=$NUM_GPUS \
-    -e CONFIG=configs/v2_jinav3.yaml \
+    -e CONFIG=${CONFIG:-configs/v2_jinav3.yaml} \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     --rm \
     --memory="60g" \

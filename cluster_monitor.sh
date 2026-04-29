@@ -2,8 +2,7 @@
 # Monitors SLURM training jobs and sends Telegram notifications.
 # Run as: nohup bash cluster_monitor.sh > monitor.log 2>&1 &
 
-BOT_TOKEN="8613714532:AAFVvUSqq4cm1Kofdm6SeVtdCGIJha9Fu3A"
-CHAT_ID="583267231"
+source ~/.telegram_credentials || { echo "Missing ~/.telegram_credentials"; exit 1; }
 LOG_DIR="$HOME/embedding-inversion-demo"
 STATE_DIR="/tmp/cluster_monitor_$$"
 mkdir -p "$STATE_DIR"

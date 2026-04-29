@@ -218,6 +218,11 @@ class ConditionalMDLM(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
+        # Timestep conditioning (paper §3.3): t estimated from mask fraction at forward time,
+        # so API is unchanged and train/inference are consistent. Zero-init = starts as identity.
+        self.t_proj = nn.Linear(1, self.hidden_dim)
+        nn.init.zeros_(self.t_proj.weight)
+        nn.init.zeros_(self.t_proj.bias)
         self.blocks = nn.ModuleList([
             TransformerBlock(self.hidden_dim, mc["num_heads"], mc["ff_dim"], mc.get("dropout", 0.0))
             for _ in range(mc["num_layers"])
@@ -316,11 +321,17 @@ class ConditionalMDLM(nn.Module):
             return self._forward_scratch(input_ids, cond_embedding)
         return self._forward_mmbert(input_ids, cond_embedding, padding_mask)
 
+    def _t_from_input(self, input_ids):
+        """Estimate t from mask fraction, inverting the log-linear schedule."""
+        frac = (input_ids == self.mask_token_id).float().mean(dim=-1, keepdim=True)
+        t = (-torch.log((1 - frac).clamp(min=1e-4)) / 5.0).clamp(0.02, 1.0)
+        return t  # [B, 1]
+
     def _forward_scratch(self, input_ids, cond_embedding):
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
         x = self.token_embed(input_ids) + self.pos_embed(positions)
-        cond = self.cond_proj(cond_embedding)
+        cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids))
         for block in self.blocks:
             x = block(x, cond)
         x = self.final_norm(x, cond)
@@ -349,7 +360,7 @@ class ConditionalMDLM(nn.Module):
             B, L = input_ids.shape
             positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
             x = self.token_embed(input_ids) + self.pos_embed(positions)
-            cond = self.cond_proj(cond_embedding)
+            cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids))
             for block in self.blocks:
                 x = block(x, cond)
             return self.final_norm(x, cond)
@@ -383,12 +394,11 @@ def apply_mask(token_ids, mask_token_id, padding_mask=None):
     B, L = token_ids.shape
     device = token_ids.device
 
-    # Random mask ratio per sample
-    # Log-linear noise schedule (MDLM paper: better than uniform)
-    u = torch.rand(B, 1, device=device)
-    eps = 1e-3
-    mask_ratio = 1 - (1 - eps) ** u  # log-linear, range ~[eps, 1.0]
-    mask_ratio = mask_ratio.clamp(min=0.1, max=1.0)  # keep min 0.1 for stability
+    # Log-linear noise schedule: α_t = e^{-λt}, λ=5.0 (MDLM paper §3.2)
+    # t ~ Uniform[0,1], mask_ratio = 1 - e^{-5t}
+    # Clamp t at min=0.02 to cap loss weight 1/t ≤ 50 (stability)
+    t = torch.rand(B, 1, device=device).clamp(min=0.02)
+    mask_ratio = 1 - torch.exp(-5.0 * t)  # range [0.095, 0.993]
 
     # Random scores for each position
     rand_scores = torch.rand(B, L, device=device)
@@ -404,4 +414,4 @@ def apply_mask(token_ids, mask_token_id, padding_mask=None):
     masked_ids = token_ids.clone()
     masked_ids[target_mask] = mask_token_id
 
-    return masked_ids, target_mask, mask_ratio  # mask_ratio: [B, 1]
+    return masked_ids, target_mask, mask_ratio, t  # t returned for 1/t loss weighting (Eq. 4)

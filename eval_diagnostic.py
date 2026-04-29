@@ -144,7 +144,7 @@ def test_in_distribution(model, config, device, data_dir, n_samples=50):
                 val_losses.append(ce)
 
             # 50% masking — easier
-            masked_ids_half, target_mask_half, _ = apply_mask(
+            masked_ids_half, target_mask_half, _, _ = apply_mask(
                 token_ids, mask_id, padding_mask)
             logits_half = model(masked_ids_half, embedding)
             preds_half = logits_half.argmax(-1)

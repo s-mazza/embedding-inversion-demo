@@ -283,7 +283,7 @@ def train(config, resume=False):
         padding_mask = batch["padding_mask"].to(device, non_blocking=True)
 
         # Apply random masking
-        masked_ids, target_mask, mask_ratio = apply_mask(token_ids, mask_token_id, padding_mask)
+        masked_ids, target_mask, mask_ratio, t_sample = apply_mask(token_ids, mask_token_id, padding_mask)
 
         # Forward
         if micro_step == 0:
@@ -298,37 +298,44 @@ def train(config, resume=False):
             # Get hidden states instead of full logits to save memory
             hidden = raw_model.forward_hidden(masked_ids, embedding, padding_mask)
 
-            # Chunked cross-entropy: compute loss without materializing full [B*32, 250K] logits
-            chunk_size = 256  # positions per chunk
-            total_positions = hidden.shape[0] * hidden.shape[1]  # B * seq_len
-            hidden_flat = hidden.view(-1, hidden.shape[-1])  # [B*32, hidden]
-            targets_flat = token_ids.view(-1)  # [B*32]
-            mask_flat = target_mask.view(-1).float()  # [B*32]
+            # Chunked cross-entropy — avoids materializing full [B*L, 250K] logit matrix
+            B_micro = token_ids.shape[0]
+            L_seq = token_ids.shape[1]
+            chunk_size = 256
+            total_positions = B_micro * L_seq
+            hidden_flat = hidden.view(-1, hidden.shape[-1])
+            targets_flat = token_ids.view(-1)
+            mask_flat = target_mask.view(-1).float()
+            w = raw_model.output_proj.weight
 
-            total_loss = torch.tensor(0.0, device=device)
+            # Accumulate CE sum per sample (flat pos j → sample j // L_seq)
+            # Required for correct per-sample 1/t weighting (paper Eq. 4)
+            sample_ce_sum = torch.zeros(B_micro, device=device)
             total_correct = 0
             total_masked = mask_flat.sum().item()
 
             for i in range(0, total_positions, chunk_size):
                 end = min(i + chunk_size, total_positions)
-                h_chunk = hidden_flat[i:end]  # [chunk, hidden]
-                t_chunk = targets_flat[i:end]  # [chunk]
-                m_chunk = mask_flat[i:end]  # [chunk]
+                h_chunk = hidden_flat[i:end]
+                t_chunk = targets_flat[i:end]
+                m_chunk = mask_flat[i:end]
 
-                # Compute logits only for this chunk (memory efficient)
-                w = raw_model.output_proj.weight  # [vocab, hidden]
-                logits_chunk = F.linear(h_chunk, w)  # [chunk, vocab]
+                logits_chunk = F.linear(h_chunk, w)
                 loss_chunk = F.cross_entropy(logits_chunk, t_chunk, reduction="none")
-                total_loss = total_loss + (loss_chunk * m_chunk).sum()
+
+                # Scatter masked CE values into per-sample buckets
+                chunk_sample_idx = torch.arange(i, end, device=device) // L_seq
+                sample_ce_sum.scatter_add_(0, chunk_sample_idx,
+                                           (loss_chunk * m_chunk).float())
 
                 with torch.no_grad():
                     preds_chunk = logits_chunk.argmax(-1)
                     total_correct += ((preds_chunk == t_chunk) * m_chunk.bool()).sum().item()
 
-            loss = total_loss / max(total_masked, 1)
-            # MDLM 1/t loss weighting (Rao-Blackwellized ELBO)
-            loss_weight = (1.0 / mask_ratio.squeeze(1)).mean()
-            loss = loss * loss_weight
+            # Mean CE per masked position per sample, then weight by 1/t (Eq. 4)
+            n_masked_per_sample = target_mask.float().sum(-1).clamp(min=1)  # [B]
+            per_sample_ce = sample_ce_sum / n_masked_per_sample             # [B]
+            loss = (per_sample_ce / t_sample.squeeze(1)).mean()
             loss = loss / grad_accum  # scale for accumulation
 
         # no_sync skips all-reduce on non-final micro-steps (reduces NCCL overhead)
@@ -351,10 +358,13 @@ def train(config, resume=False):
         nn.utils.clip_grad_norm_(raw_model.parameters(), tc["max_grad_norm"])
         scaler.step(optimizer)
         scaler.update()
-        # EMA update: ep is bf16, mp is fp32 — cast mp before lerp
+        # EMA update: accumulate in fp32 to avoid bf16 precision underflow
+        # (bf16 step size ~0.008 >> ema update ~0.0001, rounds to zero otherwise)
         with torch.no_grad():
             for ep, mp in zip(ema_model.parameters(), raw_model.parameters()):
-                ep.lerp_(mp.bfloat16(), 1 - ema_decay)
+                ep_fp32 = ep.float()
+                ep_fp32.lerp_(mp.float(), 1 - ema_decay)
+                ep.copy_(ep_fp32)
         step += 1
 
         # Log (rank 0 only)
@@ -376,8 +386,11 @@ def train(config, resume=False):
         # Validation & save best (rank 0 only)
         if is_main and step % eval_every == 0:
             ema_model.eval()
+            raw_model.eval()
             val_loss = 0.0
             val_count = 0
+            raw_val_loss = 0.0
+            raw_val_count = 0
             with torch.no_grad():
                 for i, vb in enumerate(val_loader):
                     if i >= 50:  # 50 batches = 5000 samples (lower noise)
@@ -385,11 +398,10 @@ def train(config, resume=False):
                     vids = vb["token_ids"].to(device)
                     vemb = vb["embedding"].to(device)
                     vpad = vb["padding_mask"].to(device)
-                    vm_ids, vm_mask, _ = apply_mask(vids, mask_token_id, vpad)
+                    vm_ids, vm_mask, _, _ = apply_mask(vids, mask_token_id, vpad)
 
                     with autocast('cuda', dtype=torch.bfloat16):
                         vhidden = ema_model.forward_hidden(vm_ids, vemb, vpad)
-                        # Chunked CE for validation (avoid OOM)
                         vh_flat = vhidden.view(-1, vhidden.shape[-1])
                         vt_flat = vids.view(-1)
                         vm_flat = vm_mask.view(-1).float()
@@ -404,9 +416,25 @@ def train(config, resume=False):
                     val_loss += vloss.item()
                     val_count += 1
 
+                    # Raw model val (first 10 batches only — quick progress signal)
+                    if i < 10:
+                        with autocast('cuda', dtype=torch.bfloat16):
+                            rv_hidden = raw_model.forward_hidden(vm_ids, vemb, vpad)
+                            rv_flat = rv_hidden.view(-1, rv_hidden.shape[-1])
+                            rw = raw_model.output_proj.weight
+                            rtotal = torch.tensor(0.0, device=device)
+                            for vi in range(0, rv_flat.shape[0], 256):
+                                ve = min(vi + 256, rv_flat.shape[0])
+                                rlc = F.linear(rv_flat[vi:ve], rw)
+                                rtotal = rtotal + (F.cross_entropy(rlc, vt_flat[vi:ve], reduction="none") * vm_flat[vi:ve]).sum()
+                            rvloss = rtotal / vm_flat.sum().clamp(min=1)
+                        raw_val_loss += rvloss.item()
+                        raw_val_count += 1
+
             avg_val = val_loss / max(val_count, 1)
+            avg_raw_val = raw_val_loss / max(raw_val_count, 1)
             improved = " [BEST]" if avg_val < best_val_loss else ""
-            print(f"  val_loss: {avg_val:.4f}{improved}", flush=True)
+            print(f"  val_loss (ema): {avg_val:.4f} | val_loss (raw): {avg_raw_val:.4f}{improved}", flush=True)
 
             if avg_val < best_val_loss:
                 best_val_loss = avg_val

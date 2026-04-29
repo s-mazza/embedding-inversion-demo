@@ -457,9 +457,10 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # Derive checkpoint dir from config filename (e.g. v2_gemma.yaml -> checkpoints_v2_gemma)
-    config_name = os.path.splitext(os.path.basename(args.config))[0]
-    config["_ckpt_dir"] = f"checkpoints_{config_name}"
+    # Derive checkpoint dir from config filename unless explicitly set in config
+    if "_ckpt_dir" not in config:
+        config_name = os.path.splitext(os.path.basename(args.config))[0]
+        config["_ckpt_dir"] = f"checkpoints_{config_name}"
 
     train(config, resume=args.resume)
 

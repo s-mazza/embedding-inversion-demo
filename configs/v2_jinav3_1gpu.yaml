@@ -1,3 +1,5 @@
+_ckpt_dir: checkpoints_v2_jinav3
+
 model:
   vocab_size: 250002
   max_seq_len: 32

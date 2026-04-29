@@ -11,6 +11,7 @@ docker run \
     -e CONFIG=${CONFIG:-configs/v2_jinav3.yaml} \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     --rm \
+    --init \
     --memory="60g" \
     --ipc=host \
     --gpus '"device='"$CUDA_VISIBLE_DEVICES"'"' \

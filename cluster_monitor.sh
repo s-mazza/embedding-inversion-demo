@@ -1,16 +1,19 @@
 #!/bin/bash
 # Monitors SLURM training jobs and sends Telegram notifications.
-# Run as: nohup bash cluster_monitor.sh > monitor.log 2>&1 &
+# Run as: nohup bash cluster_monitor.sh <two_gpu_job_id> <one_gpu_job_id> > monitor.log 2>&1 &
+# Job IDs are passed as arguments so they don't need to be hardcoded.
 
 source ~/.telegram_credentials || { echo "Missing ~/.telegram_credentials"; exit 1; }
 LOG_DIR="$HOME/embedding-inversion-demo"
 STATE_DIR="/tmp/cluster_monitor_$$"
 mkdir -p "$STATE_DIR"
 
-# job_id:num_gpus:log_suffix
+TWO_GPU_JOB="${1:?Usage: cluster_monitor.sh <two_gpu_job_id> <one_gpu_job_id>}"
+ONE_GPU_JOB="${2:?Usage: cluster_monitor.sh <two_gpu_job_id> <one_gpu_job_id>}"
+
 JOBS=(
-    "11063544:2:slurm-11063544.out"
-    "11078393:1:slurm-11078393-1gpu.out"
+    "${TWO_GPU_JOB}:2:slurm-${TWO_GPU_JOB}.out"
+    "${ONE_GPU_JOB}:1:slurm-${ONE_GPU_JOB}-1gpu.out"
 )
 
 MILESTONE_INTERVAL=10000   # Telegram update every N steps
@@ -59,12 +62,10 @@ monitor_log() {
             last_step=$(cat "$last_step_file" 2>/dev/null || echo 0)
 
             should_send=0
-            # milestone-based
             if [ -n "$step" ] && [ "$step" -ge $((last_step + MILESTONE_INTERVAL)) ] 2>/dev/null; then
                 echo "$step" > "$last_step_file"
                 should_send=1
             fi
-            # count-based fallback (when step not parseable)
             if [ $((val_counter % REPORT_VAL_EVERY)) -eq 0 ]; then
                 should_send=1
             fi
@@ -81,9 +82,9 @@ for entry in "${JOBS[@]}"; do
 done
 
 send "🤖 Monitor started.
-• Job 11063544 (2-GPU, 96h)
-• Job 11078393 (1-GPU backup, 7d)
-Updates: job state changes, new best model, errors, every ${MILESTONE_INTERVAL} steps."
+• Job ${TWO_GPU_JOB} (2-GPU, 96h)
+• Job ${ONE_GPU_JOB} (1-GPU backup, 7d)
+Updates: state changes, new best model, errors, every ${MILESTONE_INTERVAL} steps."
 
 # Main loop: poll job states, start log monitor when job transitions to RUNNING
 while true; do

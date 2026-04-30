@@ -120,6 +120,7 @@ def _meta(step, best_val_loss, config):
 
 def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, scaler, config):
     """Save full checkpoint for resuming training (.pt, includes optimizer state)."""
+    tmp_path = path + ".tmp"
     torch.save({
         "step": step,
         "best_val_loss": best_val_loss,
@@ -129,13 +130,16 @@ def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, opti
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "config": config,
-    }, path)
+    }, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def save_ema(path, step, best_val_loss, ema_model, config):
     """Save inference-only EMA weights as safetensors with metadata."""
     st_path = path.replace(".pt", ".safetensors")
-    safetensors_save_model(ema_model, st_path, metadata=_meta(step, best_val_loss, config))
+    tmp_path = st_path + ".tmp"
+    safetensors_save_model(ema_model, tmp_path, metadata=_meta(step, best_val_loss, config))
+    os.replace(tmp_path, st_path)
 
 
 def train(config, resume=False):
@@ -163,14 +167,14 @@ def train(config, resume=False):
     if is_main:
         print(f"Model params: {total_params:,} total, {trainable_params:,} trainable", flush=True)
 
-    # EMA model in bf16 to save ~1.2 GB VRAM per GPU (sufficient for inference)
+    # EMA model must be kept in fp32 to prevent small updates from rounding to zero
     ema_decay = tc.get("ema_decay", 0.9999)
-    ema_model = copy.deepcopy(model).bfloat16()
+    ema_model = copy.deepcopy(model).float()
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
     if is_main:
-        print(f"EMA decay: {ema_decay} (bf16)", flush=True)
+        print(f"EMA decay: {ema_decay} (fp32)", flush=True)
 
     # Batch size: use config value directly (auto-tune unreliable with chunked CE)
     batch_size = tc.get("batch_size", 128)
@@ -186,10 +190,21 @@ def train(config, resume=False):
         print(f"Train: {len(train_loader.dataset):,} samples, {len(train_loader)} batches", flush=True)
         print(f"Val: {len(val_loader.dataset):,} samples", flush=True)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"]
-    )
+    # Optimizer: exclude biases and LayerNorm/AdaLN weights from weight decay
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "bias" in name or "norm" in name or "adaln" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+    optimizer = torch.optim.AdamW([
+        {'params': decay_params, 'weight_decay': tc["weight_decay"]},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ], lr=tc["lr"])
     scaler = GradScaler('cuda')
 
     # Gradient accumulation
@@ -224,11 +239,11 @@ def train(config, resume=False):
             loaded_best_step = ckpt.get("best_step", start_step)
             if "ema_model" in ckpt:
                 ema_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in ckpt["ema_model"].items()}
-                # cast to bf16 to match ema_model dtype (checkpoint may be fp32)
-                ema_sd = {k: v.bfloat16() for k, v in ema_sd.items()}
+                # keep in fp32
+                ema_sd = {k: v.float() for k, v in ema_sd.items()}
                 ema_model.load_state_dict(ema_sd)
                 if is_main:
-                    print("Loaded EMA weights (bf16)", flush=True)
+                    print("Loaded EMA weights (fp32)", flush=True)
             if is_main:
                 print(f"Resumed at step {start_step} (best_step={loaded_best_step}, best_val_loss={best_val_loss:.4f})", flush=True)
 
@@ -332,10 +347,9 @@ def train(config, resume=False):
                     preds_chunk = logits_chunk.argmax(-1)
                     total_correct += ((preds_chunk == t_chunk) * m_chunk.bool()).sum().item()
 
-            # Mean CE per masked position per sample, then weight by 1/t (Eq. 4)
-            n_masked_per_sample = target_mask.float().sum(-1).clamp(min=1)  # [B]
-            per_sample_ce = sample_ce_sum / n_masked_per_sample             # [B]
-            loss = (per_sample_ce / t_sample.squeeze(1)).mean()
+            # MDLM Eq 4: 1/t weights the sum of CE across masked positions for each sample.
+            # (Not the mean, which would incorrectly attenuate gradients when t ≈ 1)
+            loss = (sample_ce_sum / t_sample.squeeze(1)).mean()
             loss = loss / grad_accum  # scale for accumulation
 
         # no_sync skips all-reduce on non-final micro-steps (reduces NCCL overhead)
@@ -358,13 +372,10 @@ def train(config, resume=False):
         nn.utils.clip_grad_norm_(raw_model.parameters(), tc["max_grad_norm"])
         scaler.step(optimizer)
         scaler.update()
-        # EMA update: accumulate in fp32 to avoid bf16 precision underflow
-        # (bf16 step size ~0.008 >> ema update ~0.0001, rounds to zero otherwise)
+        # EMA update (ema_model is in fp32)
         with torch.no_grad():
             for ep, mp in zip(ema_model.parameters(), raw_model.parameters()):
-                ep_fp32 = ep.float()
-                ep_fp32.lerp_(mp.float(), 1 - ema_decay)
-                ep.copy_(ep_fp32)
+                ep.lerp_(mp.float(), 1 - ema_decay)
         step += 1
 
         # Log (rank 0 only)

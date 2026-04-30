@@ -93,6 +93,13 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x, cond, padding_mask=None):
+        if padding_mask is not None:
+            # Prevent NaN in MultiheadAttention if an entire sequence is padding
+            all_padded = padding_mask.all(dim=-1)
+            if all_padded.any():
+                padding_mask = padding_mask.clone()
+                padding_mask[all_padded, 0] = False
+
         normed, alpha1 = self.adaln1(x, cond)
         attn_out, _ = self.attn(normed, normed, normed,
                                 key_padding_mask=padding_mask, need_weights=False)

@@ -1234,5 +1234,62 @@ class TestEdgeCases:
             )
 
 
+# ---------------------------------------------------------------------------
+# Section 14: Distributed training correctness
+# ---------------------------------------------------------------------------
+
+class TestDistributedCorrectness:
+
+    def test_val_loader_never_uses_distributed_sampler(self):
+        """
+        Validation runs only on rank 0. Using DistributedSampler on val_loader would shard
+        the dataset, giving rank 0 only 1/world_size of val data → biased checkpoint selection.
+        The fix: val_sampler must always be None (full val set on rank 0).
+        """
+        import inspect
+        import dataset as dataset_module
+        src = inspect.getsource(dataset_module.create_dataloaders)
+
+        # Find the val_sampler assignment line
+        lines = src.splitlines()
+        val_sampler_lines = [l for l in lines if "val_sampler" in l and "=" in l and "DistributedSampler" in l]
+        assert len(val_sampler_lines) == 0, (
+            "val_sampler uses DistributedSampler, which shards val data across ranks.\n"
+            "Validation only runs on rank 0, so rank 0 sees only 1/world_size of val set.\n"
+            "Fix: set val_sampler = None (rank 0 always iterates full val set).\n"
+            f"Offending lines: {val_sampler_lines}"
+        )
+
+    def test_val_sampler_is_none_in_source(self):
+        """val_sampler must be unconditionally None (not gated on is_dist)."""
+        import inspect
+        import dataset as dataset_module
+        src = inspect.getsource(dataset_module.create_dataloaders)
+        lines = src.splitlines()
+        # Look for the assignment: val_sampler = None
+        has_none_assignment = any(
+            "val_sampler" in l and "= None" in l and "DistributedSampler" not in l
+            for l in lines
+        )
+        assert has_none_assignment, (
+            "val_sampler is not unconditionally None in create_dataloaders. "
+            "Distributed val sampling causes rank 0 to evaluate only a shard of val data."
+        )
+
+    def test_mixed_precision_flag_read_from_config(self):
+        """
+        train.py must read the mixed_precision flag from config instead of hardcoding BF16.
+        All configs define training.mixed_precision but the flag was previously ignored.
+        """
+        import inspect
+        import train as train_module
+        src = inspect.getsource(train_module.train)
+        assert "mixed_precision" in src, (
+            "train.py does not read 'mixed_precision' from config. "
+            "The flag is defined in all configs but was being silently ignored; "
+            "AMP dtype was hardcoded to bfloat16 regardless."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

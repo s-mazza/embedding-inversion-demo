@@ -95,3 +95,27 @@ The current implementation fails to replicate the paper's results due to several
 2.  **EMA:** Store `ema_model` in `fp32` to allow tiny updates to accumulate correctly.
 3.  **Loss:** Change `Mean_CE` to `Sum_CE` in Equation 4 implementation to balance gradients across timesteps.
 4.  **v3 Conditioning:** Implement `t_proj` and AdaLN-Zero in the mmBERT path to match the paper's conditioning requirements.
+
+## 6. Gemini-Proposed Findings — Independent Verification
+
+The following three issues were proposed by Gemini. Each was independently re-verified against the actual code and assigned a verdict. Fixes applied where warranted.
+
+### 6.1 ✅ CONFIRMED + FIXED: Distributed validation is rank-0 shard only
+- **Bug:** `val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, ...)` shards the val set across all ranks, but validation runs only on rank 0 (`if is_main`). Rank 0 therefore iterates over only `1/world_size` of val data.
+- **Impact:** Best-checkpoint selection uses a biased, noisy estimate of val loss. At world_size=2: 50% of val data; at world_size=4: 25%.
+- **Fix applied:** `val_sampler = None` in `dataset.py` (unconditionally). Validation on rank 0 now always iterates the full val set. Test added: `TestDistributedCorrectness::test_val_loader_never_uses_distributed_sampler`.
+
+### 6.2 ❌ NOT A BUG (Gemini overcalled): Training/validation objective use different loss formulas
+- **Claim:** Training uses 1/t-weighted sum-CE (MDLM Eq. 4); validation uses unweighted mean-CE — therefore checkpoint selection is inconsistent with training.
+- **Verdict after review:** This is STANDARD ML PRACTICE. The 1/t weight is an optimization device to balance gradient contributions across noise levels (high-t samples would otherwise dominate). For evaluation you want a clean, interpretable number independent of the t-distribution. Unweighted mean-CE is the correct evaluation metric. The two objectives are highly correlated and val mean-CE is a perfectly valid proxy for training quality. No fix needed.
+
+### 6.3 ✅ CONFIRMED + FIXED (low severity): `mixed_precision` config flag is non-functional
+- **Bug:** All configs define `training.mixed_precision: true` but `train.py` never reads this flag; `GradScaler` and all `autocast` calls were hardcoded to BF16.
+- **Impact:** Low severity — hardcoded BF16 is correct for A100/H100. But the flag is a dead config key; setting `mixed_precision: false` has no effect.
+- **Fix applied:** `train.py` now reads `use_amp = tc.get("mixed_precision", True)` and passes `enabled=use_amp` to all `GradScaler` and `autocast` calls. Test added: `TestDistributedCorrectness::test_mixed_precision_flag_read_from_config`.
+
+### 6.4 Verification Summary
+- 6.1: CONFIRMED real bug, fixed in `dataset.py`
+- 6.2: FALSE POSITIVE — standard practice, no fix needed
+- 6.3: CONFIRMED dead config key, fixed in `train.py`
+- Test suite: 64/64 passed after fixes

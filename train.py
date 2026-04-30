@@ -205,7 +205,8 @@ def train(config, resume=False):
         {'params': decay_params, 'weight_decay': tc["weight_decay"]},
         {'params': no_decay_params, 'weight_decay': 0.0}
     ], lr=tc["lr"])
-    scaler = GradScaler('cuda')
+    use_amp = tc.get("mixed_precision", True)
+    scaler = GradScaler('cuda', enabled=use_amp)
 
     # Gradient accumulation
     grad_accum = tc.get("grad_accum", 1)
@@ -309,7 +310,7 @@ def train(config, resume=False):
                 pg["lr"] = lr
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast('cuda', dtype=torch.bfloat16):
+        with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
             # Get hidden states instead of full logits to save memory
             hidden = raw_model.forward_hidden(masked_ids, embedding, padding_mask)
 
@@ -411,7 +412,7 @@ def train(config, resume=False):
                     vpad = vb["padding_mask"].to(device)
                     vm_ids, vm_mask, _, _ = apply_mask(vids, mask_token_id, vpad)
 
-                    with autocast('cuda', dtype=torch.bfloat16):
+                    with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                         vhidden = ema_model.forward_hidden(vm_ids, vemb, vpad)
                         vh_flat = vhidden.view(-1, vhidden.shape[-1])
                         vt_flat = vids.view(-1)
@@ -429,7 +430,7 @@ def train(config, resume=False):
 
                     # Raw model val (first 10 batches only — quick progress signal)
                     if i < 10:
-                        with autocast('cuda', dtype=torch.bfloat16):
+                        with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                             rv_hidden = raw_model.forward_hidden(vm_ids, vemb, vpad)
                             rv_flat = rv_hidden.view(-1, rv_hidden.shape[-1])
                             rw = raw_model.output_proj.weight

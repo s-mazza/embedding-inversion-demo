@@ -116,7 +116,9 @@ def create_dataloaders(config, rank=0, world_size=1):
 
     is_dist = world_size > 1
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if is_dist else None
-    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if is_dist else None
+    # Validation runs only on rank 0 — do NOT use DistributedSampler (would give rank 0
+    # only 1/world_size of val data, biasing best-checkpoint selection).
+    val_sampler = None
 
     train_loader = DataLoader(
         train_ds, batch_size=tc["batch_size"],

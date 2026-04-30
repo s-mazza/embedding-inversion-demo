@@ -215,7 +215,9 @@ class ConditionalMDLM(nn.Module):
     def _init_scratch(self, mc):
         """8-layer from-scratch architecture — state-dict compatible with demo_server.py."""
         self.token_embed = nn.Embedding(self.vocab_size, self.hidden_dim)
+        nn.init.normal_(self.token_embed.weight, std=0.02)
         self.pos_embed = nn.Embedding(self.max_seq_len, self.hidden_dim)
+        nn.init.normal_(self.pos_embed.weight, std=0.02)
         cond_dim = mc["embedding_cond_dim"]
         self.cond_proj = nn.Sequential(
             nn.Linear(cond_dim, self.hidden_dim),

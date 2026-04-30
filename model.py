@@ -4,7 +4,6 @@ Conditional Masked Diffusion Language Model (CMDLM) for embedding inversion.
 Two architectures supported via config:
   - From-scratch (v2): 8-layer custom transformer, no pretrained backbone.
     Activated when 'pretrained_token_embeddings' is absent from config.
-    State-dict compatible with demo_server.py.
   - mmBERT (v3): pretrained 22-layer ModernBERT backbone with AdaLN-Zero.
     Activated when 'pretrained_token_embeddings' is set in config.
 
@@ -20,31 +19,72 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 # ---------------------------------------------------------------------------
-# From-scratch architecture (v2) — demo_server.py compatible
+# Shared conditioning modules
 # ---------------------------------------------------------------------------
 
 class AdaLN(nn.Module):
-    """Adaptive LayerNorm for from-scratch architecture (scale + shift, no gate)."""
+    """
+    AdaLN for final norm in v2 (scale + shift, no gate, zero-initialized).
+    Zero-init: at init scale=shift=0 → behaves as plain LayerNorm.
+    """
 
     def __init__(self, hidden_dim, cond_dim):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, cond):
-        params = self.proj(cond).unsqueeze(1)
+        params = self.proj(cond).unsqueeze(1)  # [B, 1, 2*hidden]
         scale, shift = params.chunk(2, dim=-1)
         return self.norm(x) * (1 + scale) + shift
 
 
+class AdaLNZero(nn.Module):
+    """
+    AdaLN-Zero (DiT-style, paper §3.3): scale + shift + gate α, all zero-initialized.
+    At init: scale=shift=α=0 → block output is fully gated away → identity mapping.
+    Used in both v2 transformer blocks and v3 mmBERT layers.
+    """
+
+    def __init__(self, hidden_dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.proj = nn.Linear(cond_dim, 3 * hidden_dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, cond):
+        """
+        Returns:
+            normalized: norm(x) * (1 + scale) + shift   [B, L, hidden]
+            alpha:      gate for gated residual           [B, 1, hidden]
+        """
+        params = self.proj(cond).unsqueeze(1)  # [B, 1, 3*hidden]
+        scale, shift, alpha = params.chunk(3, dim=-1)
+        normalized = self.norm(x) * (1 + scale) + shift
+        return normalized, alpha
+
+
+# ---------------------------------------------------------------------------
+# From-scratch architecture (v2)
+# ---------------------------------------------------------------------------
+
 class TransformerBlock(nn.Module):
-    """Standard transformer block with AdaLN conditioning (v2 from-scratch)."""
+    """
+    Transformer block with AdaLN-Zero conditioning (paper §3.3, Eq. 8-9).
+
+    Gated residuals: x = x + α * block_output(AdaLN-Zero(x, cond))
+    α is zero-initialized → block starts as identity, conditioning grows in gradually.
+    padding_mask: [B, L] True at padding positions; prevents attention to padding tokens.
+    """
 
     def __init__(self, hidden_dim, num_heads, ff_dim, dropout=0.0):
         super().__init__()
-        self.adaln1 = AdaLN(hidden_dim, hidden_dim)
+        self.adaln1 = AdaLNZero(hidden_dim, hidden_dim)
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.adaln2 = AdaLN(hidden_dim, hidden_dim)
+        self.adaln2 = AdaLNZero(hidden_dim, hidden_dim)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, ff_dim),
             nn.GELU(),
@@ -52,55 +92,19 @@ class TransformerBlock(nn.Module):
             nn.Linear(ff_dim, hidden_dim),
         )
 
-    def forward(self, x, cond):
-        normed = self.adaln1(x, cond)
-        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
-        x = x + attn_out
-        normed = self.adaln2(x, cond)
-        x = x + self.ff(normed)
+    def forward(self, x, cond, padding_mask=None):
+        normed, alpha1 = self.adaln1(x, cond)
+        attn_out, _ = self.attn(normed, normed, normed,
+                                key_padding_mask=padding_mask, need_weights=False)
+        x = x + alpha1 * attn_out          # gated residual (Eq. 8)
+        normed, alpha2 = self.adaln2(x, cond)
+        x = x + alpha2 * self.ff(normed)   # gated residual (Eq. 9)
         return x
 
 
 # ---------------------------------------------------------------------------
 # mmBERT architecture (v3) — pretrained backbone with AdaLN-Zero
 # ---------------------------------------------------------------------------
-
-class AdaLNZero(nn.Module):
-    """
-    Adaptive Layer Normalization with Zero initialization (DiT-style).
-    
-    Output: norm(x) * (1 + scale) + shift
-    Gate: x = x + alpha * block_output (alpha initialized to 0)
-    
-    All conditioning projections initialized to zero so the model starts
-    as identity (vanilla mmBERT) and gradually learns to use conditioning.
-    """
-
-    def __init__(self, hidden_dim, cond_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        # Project condition to (scale, shift, alpha)
-        self.proj = nn.Linear(cond_dim, 3 * hidden_dim)
-        # Zero initialization - model starts as identity
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, x, cond):
-        """
-        Args:
-            x: [B, L, hidden] input
-            cond: [B, cond_dim] conditioning vector
-        
-        Returns:
-            normalized: norm(x) * (1 + scale) + shift
-            alpha: [B, 1, hidden] gate for residual (to be used as x = x + alpha * block_output)
-        """
-        # cond: [B, cond_dim] -> [B, 3*hidden]
-        params = self.proj(cond).unsqueeze(1)  # [B, 1, 3*hidden]
-        scale, shift, alpha = params.chunk(3, dim=-1)  # each [B, 1, hidden]
-        normalized = self.norm(x) * (1 + scale) + shift
-        return normalized, alpha
-
 
 class ModernBertLayerWithAdaLN(nn.Module):
     """
@@ -313,27 +317,37 @@ class ConditionalMDLM(nn.Module):
         Args:
             input_ids: [B, L] token ids (with some masked by mask_token_id)
             cond_embedding: [B, cond_dim] target embedding vector
-            padding_mask: [B, L] True where padding (mmBERT path only)
+            padding_mask: [B, L] True where padding
         Returns:
             logits: [B, L, V]
         """
         if self._from_scratch:
-            return self._forward_scratch(input_ids, cond_embedding)
+            return self._forward_scratch(input_ids, cond_embedding, padding_mask)
         return self._forward_mmbert(input_ids, cond_embedding, padding_mask)
 
-    def _t_from_input(self, input_ids):
-        """Estimate t from mask fraction, inverting the log-linear schedule."""
-        frac = (input_ids == self.mask_token_id).float().mean(dim=-1, keepdim=True)
+    def _t_from_input(self, input_ids, padding_mask=None):
+        """
+        Estimate t from mask fraction, inverting the log-linear schedule (λ=5).
+        Uses only content positions (not padding) to avoid systematic underestimation.
+        padding_mask: [B, L] True at padding positions.
+        """
+        is_mask = (input_ids == self.mask_token_id).float()  # [B, L]
+        if padding_mask is not None:
+            content = (~padding_mask).float()  # [B, L], 1 at content positions
+            content_len = content.sum(dim=-1, keepdim=True).clamp(min=1)
+            frac = (is_mask * content).sum(dim=-1, keepdim=True) / content_len
+        else:
+            frac = is_mask.mean(dim=-1, keepdim=True)
         t = (-torch.log((1 - frac).clamp(min=1e-4)) / 5.0).clamp(0.02, 1.0)
         return t  # [B, 1]
 
-    def _forward_scratch(self, input_ids, cond_embedding):
+    def _forward_scratch(self, input_ids, cond_embedding, padding_mask=None):
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
         x = self.token_embed(input_ids) + self.pos_embed(positions)
-        cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids))
+        cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids, padding_mask))
         for block in self.blocks:
-            x = block(x, cond)
+            x = block(x, cond, padding_mask)
         x = self.final_norm(x, cond)
         return self.output_proj(x)
 
@@ -360,9 +374,9 @@ class ConditionalMDLM(nn.Module):
             B, L = input_ids.shape
             positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
             x = self.token_embed(input_ids) + self.pos_embed(positions)
-            cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids))
+            cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids, padding_mask))
             for block in self.blocks:
-                x = block(x, cond)
+                x = block(x, cond, padding_mask)
             return self.final_norm(x, cond)
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)

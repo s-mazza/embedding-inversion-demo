@@ -120,6 +120,13 @@ def project_at_step(records: list[dict], target_step: int, field: str) -> Option
     is_acc = (field == "token_acc")
     ys = [1.0 - y for y in ys_raw] if is_acc else ys_raw
 
+    # Refuse to project a near-constant series — the decay fit will collapse to
+    # the constant and produce meaningless projections (e.g. token_acc=0 across
+    # all early val points → "projected acc = 0" forever).
+    y_min, y_max = min(ys), max(ys)
+    if y_max - y_min < 1e-4:
+        return None
+
     params = _fit_decay(xs, ys)
     if params is not None:
         a, b, c = params
@@ -237,13 +244,20 @@ def check_trajectory(log_path: str, use_telegram: bool = False, as_json: bool = 
     print(f"  Current:   val_loss={current_val_loss:.4f}  token_acc={current_token_acc:.3f}")
     if proj_val_loss is not None:
         gap_vl = proj_val_loss - 1.60
-        gap_acc = proj_token_acc - 0.76 if proj_token_acc else None
         vl_icon = "✓" if proj_val_loss <= ALERT_VAL_LOSS_THRESHOLD else "✗"
-        acc_icon = "✓" if (proj_token_acc or 0) >= ALERT_TOKEN_ACC_THRESHOLD else "✗"
         print(f"  Projected: val_loss={proj_val_loss:.3f} (Δ{gap_vl:+.3f} vs paper) [{vl_icon}]")
+    else:
+        print(f"  Projected: val_loss not yet projectable (need {MIN_POINTS_FOR_FIT}+ val points)")
+
+    if proj_token_acc is not None:
+        gap_acc = proj_token_acc - 0.76
+        acc_icon = "✓" if proj_token_acc >= ALERT_TOKEN_ACC_THRESHOLD else "✗"
         print(f"             token_acc={proj_token_acc:.3f} (Δ{gap_acc:+.3f} vs paper) [{acc_icon}]")
     else:
-        print(f"  Projected: not enough data yet (need {MIN_POINTS_FOR_FIT}+ val points)")
+        # Common when EMA token_acc is still 0.000 across all val points (early
+        # warmup, EMA half-life ~6932 steps): the decay fit can't latch onto a
+        # constant series. Skip the line; will become projectable once acc moves.
+        print(f"             token_acc: not yet projectable (constant or insufficient signal)")
 
     if ref_gaps:
         print(f"\n  Reference comparison:")

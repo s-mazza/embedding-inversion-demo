@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "training": {
+      "command": "python3",
+      "args": ["/home/mazza/Documents/embedding-inversion-demo/training_mcp_server.py"]
+    }
+  }
+}

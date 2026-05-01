@@ -70,6 +70,20 @@ monitor_log() {
                 should_send=1
             fi
             [ "$should_send" -eq 1 ] && send "📊 [$label] $line"
+
+            # --- Trajectory early-warning (every 10 val evals, background) ---
+            if [ $((val_counter % 10)) -eq 0 ] && [ -f "$log_file" ]; then
+                python3 "$LOG_DIR/parse_training_trajectory.py" "$log_file" --telegram \
+                    2>>"$LOG_DIR/monitor.log" &
+            fi
+
+            # --- Haiku log analysis (every 20 val evals, background) ---
+            if [ $((val_counter % 20)) -eq 0 ] && [ -f "$log_file" ] && \
+               command -v python3 >/dev/null && python3 -c "import anthropic" 2>/dev/null; then
+                python3 "$LOG_DIR/haiku_log_analyst.py" \
+                    --log "$log_file" --last 100 --telegram --label "$label" \
+                    2>>"$LOG_DIR/monitor.log" &
+            fi
         fi
 
     done

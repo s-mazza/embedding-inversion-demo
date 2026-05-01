@@ -710,7 +710,10 @@ def main():
                         help="Data directory for live val loss / accuracy (optional)")
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU (skips GPU-dependent tests)")
+    parser.add_argument("--tests", default=None,
+                        help="Comma-separated list of test numbers to run, e.g. '1,2,3,4,5,6'")
     args = parser.parse_args()
+    requested = set(int(t.strip()) for t in args.tests.split(",")) if args.tests else None
 
     device = torch.device("cpu") if args.cpu or not torch.cuda.is_available() else torch.device("cuda")
 
@@ -766,19 +769,24 @@ def main():
         ema_model = copy.deepcopy(model).bfloat16().eval()
 
     # ── Run tests ──────────────────────────────────────────────────────────
-    test_architecture(model, ckpt, r)
-    test_ema_health(model, ema_model, ckpt, r)
-    test_noise_schedule(r, device)
-    test_loss_formula(model, r, device)
-    test_trajectory(step, best_val_loss, r)
+    def _want(n): return requested is None or n in requested
 
-    if args.data_dir:
-        test_live_valoss(model, ema_model, ckpt, args.data_dir, r, device)
-    else:
-        r.header(7, "Live Val Loss & Token Accuracy", "SKIPPED — provide --data-dir to run")
-        r.skip("Skipped (no --data-dir provided)")
+    if _want(2): test_architecture(model, ckpt, r)
+    if _want(3): test_ema_health(model, ema_model, ckpt, r)
+    if _want(4): test_noise_schedule(r, device)
+    if _want(5): test_loss_formula(model, r, device)
+    if _want(6): test_trajectory(step, best_val_loss, r)
+
+    if _want(7):
+        if args.data_dir:
+            test_live_valoss(model, ema_model, ckpt, args.data_dir, r, device)
+        else:
+            r.header(7, "Live Val Loss & Token Accuracy", "SKIPPED — provide --data-dir to run")
+            r.skip("Skipped (no --data-dir provided)")
 
     r.summary()
+    if r.counts["FAIL"] > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

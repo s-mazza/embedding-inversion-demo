@@ -118,11 +118,12 @@ def _meta(step, best_val_loss, config):
     }
 
 
-def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, scaler, config):
+def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, scaler, config, epoch=0):
     """Save full checkpoint for resuming training (.pt, includes optimizer state)."""
     tmp_path = path + ".tmp"
     torch.save({
         "step": step,
+        "epoch": epoch,
         "best_val_loss": best_val_loss,
         "best_step": best_step,
         "model": model.state_dict(),
@@ -206,7 +207,7 @@ def train(config, resume=False):
         {'params': no_decay_params, 'weight_decay': 0.0}
     ], lr=tc["lr"])
     use_amp = tc.get("mixed_precision", True)
-    scaler = GradScaler('cuda', enabled=use_amp)
+    scaler = GradScaler('cuda', enabled=False)  # BF16 has fp32 dynamic range; scaling is a no-op
 
     # Gradient accumulation
     grad_accum = tc.get("grad_accum", 1)
@@ -216,6 +217,7 @@ def train(config, resume=False):
 
     # Resume
     start_step = 0
+    epoch = 0
     loaded_best_step = 0
     ckpt_dir = config.get("_ckpt_dir", "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -236,6 +238,7 @@ def train(config, resume=False):
             optimizer.load_state_dict(ckpt["optimizer"])
             scaler.load_state_dict(ckpt["scaler"])
             start_step = ckpt["step"]
+            epoch = ckpt.get("epoch", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             loaded_best_step = ckpt.get("best_step", start_step)
             if "ema_model" in ckpt:
@@ -276,7 +279,6 @@ def train(config, resume=False):
     total_samples = 0
     t0 = time.time()
     data_iter = iter(train_loader)
-    epoch = 0
 
     if is_main:
         print(f"\n=== Training started (step {step}/{max_steps}) ===", flush=True)
@@ -403,9 +405,10 @@ def train(config, resume=False):
             val_count = 0
             raw_val_loss = 0.0
             raw_val_count = 0
-            with torch.no_grad():
+            with torch.no_grad(), torch.random.fork_rng():
+                torch.manual_seed(42)
                 for i, vb in enumerate(val_loader):
-                    if i >= 50:  # 50 batches = 5000 samples (lower noise)
+                    if i >= 50:  # 50 batches = 10000 samples (batch_size=200)
                         break
                     vids = vb["token_ids"].to(device)
                     vemb = vb["embedding"].to(device)
@@ -448,17 +451,38 @@ def train(config, resume=False):
             improved = " [BEST]" if avg_val < best_val_loss else ""
             print(f"  val_loss (ema): {avg_val:.4f} | val_loss (raw): {avg_raw_val:.4f}{improved}", flush=True)
 
+            # EMA token accuracy at 100% masking (paper Table 1 metric: 76.0% @ step 62500)
+            with torch.no_grad():
+                full_mask_correct, full_mask_total = 0, 0
+                for vi2, vb2 in enumerate(val_loader):
+                    if vi2 >= 10:
+                        break
+                    vids2 = vb2["token_ids"].to(device)
+                    vemb2 = vb2["embedding"].to(device)
+                    vpad2 = vb2["padding_mask"].to(device)
+                    vmask = ~vpad2
+                    vids_masked = vids2.clone()
+                    vids_masked[vmask] = mask_token_id
+                    with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                        vh2 = ema_model.forward_hidden(vids_masked, vemb2, vpad2)
+                        vlogits2 = F.linear(vh2, ema_model.output_proj.weight)
+                    preds2 = vlogits2.argmax(-1)
+                    full_mask_correct += ((preds2 == vids2) & vmask).sum().item()
+                    full_mask_total   += vmask.sum().item()
+            token_acc = full_mask_correct / max(full_mask_total, 1)
+            print(f"  token_acc (EMA, 100% mask): {token_acc:.3f}  [paper target: 0.760 @ step 62500]", flush=True)
+
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
                 best_step = step
-                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
+                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
                 save_ema(f"{ckpt_dir}/best_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved best.pt + best_ema.pt (step {step}, val_loss {avg_val:.4f})", flush=True)
 
             # Early stopping check
             if step - best_step >= early_stop_patience and step > early_stop_patience:
                 print(f"\n=== Early stopping: no improvement for {step - best_step} steps (patience={early_stop_patience}) ===", flush=True)
-                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
+                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
                 save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
                 if is_dist:
@@ -466,13 +490,13 @@ def train(config, resume=False):
                 return
 
             # Save latest for resume
-            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
+            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
 
             # Save milestone checkpoints for paper experiments
             milestones = {10000, 25000, 50000, 100000, 200000}
             if step in milestones:
                 mpath = f"{ckpt_dir}/step_{step}.pt"
-                save_checkpoint(mpath, step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
+                save_checkpoint(mpath, step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
                 save_ema(f"{ckpt_dir}/step_{step}_ema.pt", step, best_val_loss, ema_model, config)
                 print(f"  Saved milestone: {mpath} + ema", flush=True)
 
@@ -480,7 +504,7 @@ def train(config, resume=False):
 
     if is_main:
         print(f"\n=== Training complete ({step} steps) ===", flush=True)
-        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config)
+        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
         save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
         print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
 

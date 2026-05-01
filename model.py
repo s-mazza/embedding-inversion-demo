@@ -67,24 +67,52 @@ class AdaLNZero(nn.Module):
         return normalized, alpha
 
 
+class AdaLNZeroSplit(nn.Module):
+    """
+    Per-layer t and c conditioning (paper Eq. 6-9, per-layer superscript ℓ).
+    Each block has independent c_proj and t_proj, combined additively.
+    All projections zero-initialized → identity at init.
+    """
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.c_proj = nn.Linear(hidden_dim, 3 * hidden_dim)
+        self.t_proj = nn.Linear(hidden_dim, 3 * hidden_dim)
+        nn.init.zeros_(self.c_proj.weight)
+        nn.init.zeros_(self.c_proj.bias)
+        nn.init.zeros_(self.t_proj.weight)
+        nn.init.zeros_(self.t_proj.bias)
+
+    def forward(self, x, cond_c, cond_t):
+        c_params = self.c_proj(cond_c).unsqueeze(1)  # [B, 1, 3*hidden]
+        t_params = self.t_proj(cond_t).unsqueeze(1)  # [B, 1, 3*hidden]
+        scale_c, shift_c, alpha_c = c_params.chunk(3, dim=-1)
+        scale_t, shift_t, alpha_t = t_params.chunk(3, dim=-1)
+        scale = scale_c + scale_t
+        shift = shift_c + shift_t
+        alpha = alpha_c + alpha_t
+        return self.norm(x) * (1 + scale) + shift, alpha
+
+
 # ---------------------------------------------------------------------------
 # From-scratch architecture (v2)
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
     """
-    Transformer block with AdaLN-Zero conditioning (paper §3.3, Eq. 8-9).
+    Transformer block with per-layer AdaLN-Zero conditioning (paper §3.3, Eq. 6-9).
 
-    Gated residuals: x = x + α * block_output(AdaLN-Zero(x, cond))
-    α is zero-initialized → block starts as identity, conditioning grows in gradually.
+    Each block has independent c_proj and t_proj (via AdaLNZeroSplit) so layers can
+    learn different t vs. c sensitivities. Gated residuals ensure identity at init.
     padding_mask: [B, L] True at padding positions; prevents attention to padding tokens.
     """
 
     def __init__(self, hidden_dim, num_heads, ff_dim, dropout=0.0):
         super().__init__()
-        self.adaln1 = AdaLNZero(hidden_dim, hidden_dim)
+        self.adaln1 = AdaLNZeroSplit(hidden_dim)
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.adaln2 = AdaLNZero(hidden_dim, hidden_dim)
+        self.adaln2 = AdaLNZeroSplit(hidden_dim)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, ff_dim),
             nn.GELU(),
@@ -92,7 +120,7 @@ class TransformerBlock(nn.Module):
             nn.Linear(ff_dim, hidden_dim),
         )
 
-    def forward(self, x, cond, padding_mask=None):
+    def forward(self, x, cond_c, cond_t, padding_mask=None):
         if padding_mask is not None:
             # Prevent NaN in MultiheadAttention if an entire sequence is padding
             all_padded = padding_mask.all(dim=-1)
@@ -100,12 +128,12 @@ class TransformerBlock(nn.Module):
                 padding_mask = padding_mask.clone()
                 padding_mask[all_padded, 0] = False
 
-        normed, alpha1 = self.adaln1(x, cond)
+        normed, alpha1 = self.adaln1(x, cond_c, cond_t)
         attn_out, _ = self.attn(normed, normed, normed,
                                 key_padding_mask=padding_mask, need_weights=False)
-        x = x + alpha1 * attn_out          # gated residual (Eq. 8)
-        normed, alpha2 = self.adaln2(x, cond)
-        x = x + alpha2 * self.ff(normed)   # gated residual (Eq. 9)
+        x = x + alpha1 * attn_out
+        normed, alpha2 = self.adaln2(x, cond_c, cond_t)
+        x = x + alpha2 * self.ff(normed)
         return x
 
 
@@ -225,22 +253,20 @@ class ConditionalMDLM(nn.Module):
         nn.init.normal_(self.token_embed.weight, std=0.02)
         self.pos_embed = nn.Embedding(self.max_seq_len, self.hidden_dim)
         nn.init.normal_(self.pos_embed.weight, std=0.02)
+        self.embed_norm = nn.LayerNorm(self.hidden_dim)
         cond_dim = mc["embedding_cond_dim"]
         self.cond_proj = nn.Sequential(
             nn.Linear(cond_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        # Timestep conditioning (paper §3.3): t estimated from mask fraction at forward time,
-        # so API is unchanged and train/inference are consistent. Zero-init = starts as identity.
-        self.t_proj = nn.Linear(1, self.hidden_dim)
-        nn.init.zeros_(self.t_proj.weight)
-        nn.init.zeros_(self.t_proj.bias)
+        # Shared scalar-t → hidden embedding; per-layer c/t projections live in AdaLNZeroSplit.
+        self.t_embed = nn.Linear(1, self.hidden_dim)
         self.blocks = nn.ModuleList([
             TransformerBlock(self.hidden_dim, mc["num_heads"], mc["ff_dim"], mc.get("dropout", 0.0))
             for _ in range(mc["num_layers"])
         ])
-        self.final_norm = AdaLN(self.hidden_dim, self.hidden_dim)
+        self.final_norm = AdaLNZero(self.hidden_dim, self.hidden_dim)
         self.output_proj = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
         if mc.get("tie_weights", False):
             self.output_proj.weight = self.token_embed.weight
@@ -353,12 +379,13 @@ class ConditionalMDLM(nn.Module):
     def _forward_scratch(self, input_ids, cond_embedding, padding_mask=None):
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
-        x = self.token_embed(input_ids) + self.pos_embed(positions)
-        cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids, padding_mask))
+        x = self.embed_norm(self.token_embed(input_ids) + self.pos_embed(positions))
+        cond_c = self.cond_proj(cond_embedding)
+        cond_t = self.t_embed(self._t_from_input(input_ids, padding_mask))
         for block in self.blocks:
-            x = block(x, cond, padding_mask)
-        x = self.final_norm(x, cond)
-        return self.output_proj(x)
+            x = block(x, cond_c, cond_t, padding_mask)
+        x_normed, _ = self.final_norm(x, cond_c + cond_t)
+        return self.output_proj(x_normed)
 
     def _forward_mmbert(self, input_ids, cond_embedding, padding_mask=None):
         hidden_states = self.token_embed(input_ids)
@@ -382,11 +409,13 @@ class ConditionalMDLM(nn.Module):
         if self._from_scratch:
             B, L = input_ids.shape
             positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
-            x = self.token_embed(input_ids) + self.pos_embed(positions)
-            cond = self.cond_proj(cond_embedding) + self.t_proj(self._t_from_input(input_ids, padding_mask))
+            x = self.embed_norm(self.token_embed(input_ids) + self.pos_embed(positions))
+            cond_c = self.cond_proj(cond_embedding)
+            cond_t = self.t_embed(self._t_from_input(input_ids, padding_mask))
             for block in self.blocks:
-                x = block(x, cond, padding_mask)
-            return self.final_norm(x, cond)
+                x = block(x, cond_c, cond_t, padding_mask)
+            x_normed, _ = self.final_norm(x, cond_c + cond_t)
+            return x_normed
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
         hidden_states = self.embed_drop(hidden_states)

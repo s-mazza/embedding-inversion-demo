@@ -119,3 +119,96 @@ The following three issues were proposed by Gemini. Each was independently re-ve
 - 6.2: FALSE POSITIVE — standard practice, no fix needed
 - 6.3: CONFIRMED dead config key, fixed in `train.py`
 - Test suite: 64/64 passed after fixes
+
+---
+
+## 7. Audit Round 2 — 9 New Issues (All Confirmed + Fixed)
+
+Deep audit targeting paper §3.3 Eq. 5–9 and training infrastructure. All 9 issues
+are data-proven against the live code. Test suite: **88/88 passed** after fixes.
+
+### 7.1 ✅ CRITICAL + FIXED: Conditioning architecture deviates from paper Eq. 6–9 (per-layer)
+
+**Paper (Eq. 6–7):** Each transformer layer ℓ has *independent* `MLP_t^(ℓ)` and `MLP_c^(ℓ)`.
+**Code (before fix):** A single shared `t_proj = Linear(1, 768)` and `cond_proj` was computed
+*once* before the block loop and reused unchanged across all 8 layers.
+**Impact:** Layers could not independently learn t vs. c sensitivity. The single `t_proj`
+accumulated gradients from all 8 blocks simultaneously.
+**Fix:** New `AdaLNZeroSplit` class with independent `c_proj` and `t_proj` per block, combined
+additively inside the block. Shared `t_embed = Linear(1, 768)` maps scalar t → hidden vector;
+per-layer projections from there. `TransformerBlock.forward` updated to `(x, cond_c, cond_t, ...)`.
+
+### 7.2 ✅ HIGH + FIXED (auto): `t_proj.weight` in wrong optimizer param group
+
+**Before:** Old shared `t_proj.weight` was in `decay_params` (no "adaln"/"norm"/"bias" match).
+**After Issue 7.1 fix:** Per-layer t_proj lives inside `adaln1.t_proj`, so `"adaln"` substring
+match correctly routes it to `no_decay_params`. Auto-fixed by the Issue 7.1 architectural change.
+
+### 7.3 ✅ HIGH + FIXED: Missing post-embedding LayerNorm (re-confirms findings.md §3.1)
+
+**Bug:** `_forward_scratch` computed `x = token_embed + pos_embed` with no normalization before
+the first transformer block.
+**Fix:** Added `self.embed_norm = nn.LayerNorm(hidden_dim)` applied as `embed_norm(embed + pos)`.
+Applied in both `_forward_scratch` and `forward_hidden`.
+
+### 7.4 ✅ HIGH + FIXED: GradScaler is a no-op with BF16 + DDP divergence risk
+
+**Bug:** `GradScaler('cuda', enabled=use_amp)` — BF16 has fp32 dynamic range; no underflow risk.
+The initial scale (65536) never changes. `unscale_` → scale → no-op round-trip.
+**DDP risk:** `_check_inf_per_device()` runs per-rank without synchronization; asymmetric inf
+detection causes parameter divergence.
+**Fix:** `scaler = GradScaler('cuda', enabled=False)`. All scaler API calls become no-ops;
+`autocast` still controlled by `use_amp` from config.
+
+### 7.5 ✅ MEDIUM + FIXED: Epoch counter not saved/restored on checkpoint resume
+
+**Bug:** `epoch` (used as seed for `DistributedSampler.set_epoch`) was not in the checkpoint
+dict. Every resume restarted from `epoch=0`, repeating the same shuffle orderings.
+**Fix:** `save_checkpoint` now accepts `epoch=0` kwarg and writes `"epoch": epoch` to the dict.
+Resume code reads `epoch = ckpt.get("epoch", 0)`. All 5 call sites updated.
+
+### 7.6 ✅ MEDIUM + FIXED: `final_norm` was AdaLN not AdaLNZero (re-confirms §3.3)
+
+**Bug:** `self.final_norm = AdaLN(hidden_dim, hidden_dim)` — scale+shift only, no gate α.
+At step 0, AdaLN applies `LayerNorm(x) × 1 + 0 = LayerNorm(x)` which is non-trivial even
+though all upstream blocks are identity (α=0). Breaks "identity at init" framing.
+**Fix:** Changed to `AdaLNZero(hidden_dim, hidden_dim)`. Forward paths updated to unpack
+`(x_normed, _) = self.final_norm(x, cond_c + cond_t)`.
+
+### 7.7 ✅ MEDIUM + FIXED: Paper metric (76% token accuracy) never logged during training
+
+**Bug:** `val_loss` (unweighted mean-CE) was the only logged metric. Paper Table 1 reports
+*token accuracy at 100% masking*. Without logging it, there was no way to know during
+training if the model was on track to hit 76%.
+**Fix:** Added 100%-mask token accuracy loop after each val evaluation (10 batches of EMA model).
+Prints `token_acc (EMA, 100% mask): X.XXX  [paper target: 0.760 @ step 62500]`.
+
+### 7.8 ✅ MEDIUM + FIXED: Val comment said "5000 samples", actual count is 10000
+
+**Bug:** Line 408: `# 50 batches = 5000 samples (lower noise)` — with `batch_size=200`,
+50 × 200 = 10,000, not 5,000. Stale from an earlier configuration.
+**Fix:** Updated comment to `# 50 batches = 10000 samples (batch_size=200)`.
+
+### 7.9 ✅ LOW + FIXED: Non-deterministic val masking → noisy checkpoint selection
+
+**Bug:** `apply_mask` in the val loop samples fresh `t ~ U[0.02, 1]` with no fixed seed.
+The same model evaluated twice gives slightly different `val_loss`. Noisy best-checkpoint
+selection — runs with unlucky t draws appear worse.
+**Fix:** Wrapped val loop with `with torch.no_grad(), torch.random.fork_rng():` +
+`torch.manual_seed(42)`. Training RNG state is restored after val; val masking is
+reproducible across all eval calls.
+
+### 7.10 Summary
+| # | Severity | Issue | File(s) | Status |
+|---|----------|-------|---------|--------|
+| 7.1 | CRITICAL | Per-layer t/c conditioning (paper Eq. 6-9) | model.py | ✅ FIXED |
+| 7.2 | HIGH | t_proj.weight in decay_params | train.py | ✅ AUTO-FIXED |
+| 7.3 | HIGH | Missing post-embedding LayerNorm | model.py | ✅ FIXED |
+| 7.4 | HIGH | GradScaler no-op + DDP divergence risk | train.py | ✅ FIXED |
+| 7.5 | MEDIUM | epoch not saved/restored on resume | train.py | ✅ FIXED |
+| 7.6 | MEDIUM | final_norm is AdaLN not AdaLNZero | model.py | ✅ FIXED |
+| 7.7 | MEDIUM | Paper metric (token acc 76%) never logged | train.py | ✅ FIXED |
+| 7.8 | MEDIUM | Val comment "5000 samples" wrong by 2× | train.py | ✅ FIXED |
+| 7.9 | LOW | Non-deterministic val masking | train.py | ✅ FIXED |
+
+**Test suite: 88/88 passed** (`test_training_correctness.py` + `test_v2_audit2.py`)

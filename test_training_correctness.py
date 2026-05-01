@@ -195,19 +195,21 @@ class TestAdaLNZero:
         assert (small_model.final_norm.proj.bias == 0.0).all()
 
     def test_t_proj_zero_at_init(self, small_model):
-        """t_proj must be zero-initialized (starts as identity, conditioning grows in)."""
-        assert (small_model.t_proj.weight == 0.0).all()
-        assert (small_model.t_proj.bias == 0.0).all()
+        """Per-layer AdaLNZeroSplit t_proj weights must be zero-initialized (identity at init)."""
+        for name, param in small_model.named_parameters():
+            if "adaln" in name and "t_proj" in name:
+                assert (param == 0.0).all(), (
+                    f"{name} is not all-zero at init. "
+                    "AdaLNZeroSplit t_proj requires zero-init for identity-at-init property."
+                )
 
     def test_blocks_are_identity_at_init(self, small_model):
         """
         With AdaLN-Zero (alpha=0), every transformer block is a pure identity.
         x after N blocks = x before blocks (up to float precision).
-        The only transformation is final_norm (LayerNorm).
         """
         model = small_model.eval()
         B, L = 2, SMALL["model"]["max_seq_len"]
-        mask_id = SMALL["model"]["mask_token_id"]
         hidden_dim = SMALL["model"]["hidden_dim"]
 
         input_ids = torch.randint(0, 100, (B, L))
@@ -215,17 +217,16 @@ class TestAdaLNZero:
 
         with torch.no_grad():
             positions = torch.arange(L).unsqueeze(0)
-            x_input = model.token_embed(input_ids) + model.pos_embed(positions)
+            x_input = model.embed_norm(model.token_embed(input_ids) + model.pos_embed(positions))
 
-            cond = model.cond_proj(cond_embed) + model.t_proj(
-                model._t_from_input(input_ids)
-            )
+            cond_c = model.cond_proj(cond_embed)
+            cond_t = model.t_embed(model._t_from_input(input_ids))
 
             x = x_input.clone()
             for block in model.blocks:
-                x = block(x, cond)
+                x = block(x, cond_c, cond_t)
 
-        # x should equal x_input (identity through blocks)
+        # x should equal x_input (identity through blocks when all alphas are 0)
         max_diff = (x - x_input).abs().max().item()
         assert max_diff < 1e-5, (
             f"Max diff through blocks at init = {max_diff:.2e}. "
@@ -233,15 +234,16 @@ class TestAdaLNZero:
         )
 
     def test_alpha_values_zero_at_init(self, small_model):
-        """Explicitly verify all alpha outputs are zero at init."""
+        """Explicitly verify all alpha outputs are zero at init (AdaLNZeroSplit)."""
         model = small_model.eval()
         B, L = 2, SMALL["model"]["max_seq_len"]
-        cond = torch.randn(B, SMALL["model"]["hidden_dim"])
+        cond_c = torch.randn(B, SMALL["model"]["hidden_dim"])
+        cond_t = torch.randn(B, SMALL["model"]["hidden_dim"])
 
         for i, block in enumerate(model.blocks):
             x = torch.randn(B, L, SMALL["model"]["hidden_dim"])
-            _, alpha1 = block.adaln1(x, cond)
-            _, alpha2 = block.adaln2(x, cond)
+            _, alpha1 = block.adaln1(x, cond_c, cond_t)
+            _, alpha2 = block.adaln2(x, cond_c, cond_t)
             assert (alpha1 == 0.0).all(), f"Block {i} alpha1 is not zero at init"
             assert (alpha2 == 0.0).all(), f"Block {i} alpha2 is not zero at init"
 
@@ -288,7 +290,7 @@ class TestGradientFlow:
 
     def test_adaln_proj_nonzero_grad_at_init(self, small_model):
         """
-        AdaLN proj gets non-zero gradient even at init.
+        AdaLNZeroSplit c_proj and t_proj get non-zero gradients at init.
         Gradient flows via the alpha path: d(loss)/d(alpha) = d(loss)/d(x) * block_out,
         which is non-zero even when alpha=0.
         """
@@ -297,33 +299,41 @@ class TestGradientFlow:
         loss.backward()
 
         for i, block in enumerate(model.blocks):
-            g1 = block.adaln1.proj.weight.grad
-            g2 = block.adaln2.proj.weight.grad
-            assert g1 is not None and (g1.abs() > 1e-9).any(), (
-                f"Block {i} adaln1.proj has zero/None grad — conditioning cannot learn."
+            gc1 = block.adaln1.c_proj.weight.grad
+            gt1 = block.adaln1.t_proj.weight.grad
+            gc2 = block.adaln2.c_proj.weight.grad
+            gt2 = block.adaln2.t_proj.weight.grad
+            assert gc1 is not None and (gc1.abs() > 1e-9).any(), (
+                f"Block {i} adaln1.c_proj has zero/None grad — c conditioning cannot learn."
             )
-            assert g2 is not None and (g2.abs() > 1e-9).any(), (
-                f"Block {i} adaln2.proj has zero/None grad."
+            assert gt1 is not None and (gt1.abs() > 1e-9).any(), (
+                f"Block {i} adaln1.t_proj has zero/None grad — t conditioning cannot learn."
+            )
+            assert gc2 is not None and (gc2.abs() > 1e-9).any(), (
+                f"Block {i} adaln2.c_proj has zero/None grad."
+            )
+            assert gt2 is not None and (gt2.abs() > 1e-9).any(), (
+                f"Block {i} adaln2.t_proj has zero/None grad."
             )
 
     def test_t_proj_nonzero_grad(self, small_model):
-        """t_proj gets gradient via the adaln path (starts at step 1 since adaln is zero-initialized)."""
+        """t_embed gets gradient via AdaLNZeroSplit.t_proj after step 1 (when t_proj becomes non-zero)."""
         model = small_model.train()
         optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
-        
+
         # Step 0
         loss = self._get_loss(model)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        
+
         # Step 1
         loss = self._get_loss(model)
         loss.backward()
 
-        g = model.t_proj.weight.grad
+        g = model.t_embed.weight.grad
         assert g is not None and (g.abs() > 1e-9).any(), (
-            "t_proj.weight has zero/None gradient. t conditioning cannot learn."
+            "t_embed.weight has zero/None gradient. t conditioning cannot learn."
         )
 
     def test_cond_proj_nonzero_grad(self, small_model):

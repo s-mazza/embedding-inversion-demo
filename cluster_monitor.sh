@@ -4,6 +4,7 @@
 # Job IDs are passed as arguments so they don't need to be hardcoded.
 
 source ~/.telegram_credentials || { echo "Missing ~/.telegram_credentials"; exit 1; }
+export BOT_TOKEN CHAT_ID ANTHROPIC_API_KEY  # make visible to Python subprocesses
 LOG_DIR="$HOME/embedding-inversion-demo"
 STATE_DIR="/tmp/cluster_monitor_$$"
 mkdir -p "$STATE_DIR"

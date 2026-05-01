@@ -1,3 +1,6 @@
+# Docker image dependencies (pinned). Installed into the emb-inversion image.
+# Rebuild after changes: ssh faretra "cd ~/embedding-inversion-demo && docker build -f build/Dockerfile -t emb-inversion ."
+# See requirements.txt (project root) for local dev + tooling dependencies.
 torch==2.6.0
 transformers==4.51.3
 safetensors==0.5.3

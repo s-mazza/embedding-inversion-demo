@@ -1,9 +1,20 @@
+# Local development dependencies (NOT used by Docker).
+# Docker uses build/requirements.txt (pinned versions, installed into emb-inversion image).
+#
+# Install locally:   pip install -r requirements.txt
+# Install on cluster (outside Docker, for monitoring tools):
+#   pip3 install --user anthropic scipy
+
 fastapi>=0.104.0
 uvicorn>=0.24.0
 torch>=2.0.0
 transformers>=4.35.0
 numpy>=1.24.0
 pyyaml>=6.0
-anthropic>=0.50.0
-mcp>=1.0.0
+
+# Tooling (training_dashboard.py, parse_training_trajectory.py, haiku_log_analyst.py)
 scipy>=1.10.0
+anthropic>=0.50.0
+
+# MCP server (training_mcp_server.py, local only)
+mcp>=1.0.0

@@ -106,19 +106,30 @@ def _project_linear(xs: list[float], ys: list[float], target_x: float) -> Option
 
 
 def project_at_step(records: list[dict], target_step: int, field: str) -> Optional[float]:
-    """Project field value at target_step using curve fitting or linear fallback."""
+    """Project field value at target_step using curve fitting or linear fallback.
+
+    token_acc is increasing, so we fit its complement (1 - acc) as a decay
+    curve and invert back. val_loss is already decreasing so fits directly.
+    """
     xs = [r["step"] for r in records if r[field] is not None]
-    ys = [r[field] for r in records if r[field] is not None]
+    ys_raw = [r[field] for r in records if r[field] is not None]
 
     if len(xs) < MIN_POINTS_FOR_FIT:
         return None
 
+    is_acc = (field == "token_acc")
+    ys = [1.0 - y for y in ys_raw] if is_acc else ys_raw
+
     params = _fit_decay(xs, ys)
     if params is not None:
         a, b, c = params
-        return a * math.exp(-b * target_step) + c
+        projected = a * math.exp(-b * target_step) + c
+    else:
+        projected = _project_linear(xs, ys, target_step)
 
-    return _project_linear(xs, ys, target_step)
+    if projected is None:
+        return None
+    return max(0.0, min(1.0, 1.0 - projected)) if is_acc else max(0.0, projected)
 
 
 def find_reference_gap(records: list[dict]) -> list[str]:

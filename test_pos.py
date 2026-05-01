@@ -1,3 +1,5 @@
+# LEGACY: Position sensitivity test for mmBERT (v3) path — superseded by v2 (test_pos_v2.py).
+# Active v2 tests: test_training_correctness.py + test_v2_audit2.py (run via run_tests.sh)
 
 import torch
 import yaml

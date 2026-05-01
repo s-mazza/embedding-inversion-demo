@@ -1,3 +1,5 @@
+# LEGACY: Basic EMA bf16 precision test — superseded by test_training_correctness.py::TestEMAHealth.
+# Active v2 tests: test_training_correctness.py + test_v2_audit2.py (run via run_tests.sh)
 
 import torch
 

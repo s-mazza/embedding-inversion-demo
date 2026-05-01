@@ -1,3 +1,5 @@
+# LEGACY: Tests for the mmBERT (v3) path — superseded by v2 from-scratch architecture.
+# Active v2 tests: test_training_correctness.py + test_v2_audit2.py (run via run_tests.sh)
 
 import torch
 import yaml

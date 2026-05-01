@@ -14,7 +14,7 @@ model:
 
 training:
   batch_size: 200
-  grad_accum: 4          # 2 GPUs x 4 accum x 200 batch = 1600 effective (matches paper)
+  grad_accum: 1          # 2 GPUs x 1 accum x 200 batch = 400 effective (paper: 380-400)
   max_steps: 200000
   lr: 0.0001
   min_lr_ratio: 0.1

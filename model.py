@@ -266,7 +266,7 @@ class ConditionalMDLM(nn.Module):
             TransformerBlock(self.hidden_dim, mc["num_heads"], mc["ff_dim"], mc.get("dropout", 0.0))
             for _ in range(mc["num_layers"])
         ])
-        self.final_norm = AdaLNZero(self.hidden_dim, self.hidden_dim)
+        self.final_norm = AdaLNZeroSplit(self.hidden_dim)
         self.output_proj = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
         if mc.get("tie_weights", False):
             self.output_proj.weight = self.token_embed.weight
@@ -347,18 +347,20 @@ class ConditionalMDLM(nn.Module):
         # Gradient checkpointing (disabled by default)
         self.use_checkpoint = False
 
-    def forward(self, input_ids, cond_embedding, padding_mask=None):
+    def forward(self, input_ids, cond_embedding, padding_mask=None, t=None):
         """
         Args:
             input_ids: [B, L] token ids (with some masked by mask_token_id)
             cond_embedding: [B, cond_dim] target embedding vector
             padding_mask: [B, L] True where padding
+            t: [B, 1] explicit timestep. If None, recovered from realised mask
+                fraction via _t_from_input (inference fallback).
         Returns:
             logits: [B, L, V]
         """
         if self._from_scratch:
-            return self._forward_scratch(input_ids, cond_embedding, padding_mask)
-        return self._forward_mmbert(input_ids, cond_embedding, padding_mask)
+            return self._forward_scratch(input_ids, cond_embedding, padding_mask, t)
+        return self._forward_mmbert(input_ids, cond_embedding, padding_mask, t)
 
     def _t_from_input(self, input_ids, padding_mask=None):
         """
@@ -376,18 +378,20 @@ class ConditionalMDLM(nn.Module):
         t = (-torch.log((1 - frac).clamp(min=1e-4)) / 5.0).clamp(0.02, 1.0)
         return t  # [B, 1]
 
-    def _forward_scratch(self, input_ids, cond_embedding, padding_mask=None):
+    def _forward_scratch(self, input_ids, cond_embedding, padding_mask=None, t=None):
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
         x = self.embed_norm(self.token_embed(input_ids) + self.pos_embed(positions))
         cond_c = self.cond_proj(cond_embedding)
-        cond_t = self.t_embed(self._t_from_input(input_ids, padding_mask))
+        if t is None:
+            t = self._t_from_input(input_ids, padding_mask)
+        cond_t = self.t_embed(t)
         for block in self.blocks:
             x = block(x, cond_c, cond_t, padding_mask)
-        x_normed, _ = self.final_norm(x, cond_c + cond_t)
+        x_normed, _ = self.final_norm(x, cond_c, cond_t)
         return self.output_proj(x_normed)
 
-    def _forward_mmbert(self, input_ids, cond_embedding, padding_mask=None):
+    def _forward_mmbert(self, input_ids, cond_embedding, padding_mask=None, t=None):
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
         hidden_states = self.embed_drop(hidden_states)
@@ -404,17 +408,23 @@ class ConditionalMDLM(nn.Module):
         hidden_states, _ = self.final_adaln(hidden_states, cond)
         return self.output_proj(hidden_states)
 
-    def forward_hidden(self, input_ids, cond_embedding, padding_mask=None):
-        """Returns hidden states before output_proj."""
+    def forward_hidden(self, input_ids, cond_embedding, padding_mask=None, t=None):
+        """Returns hidden states before output_proj.
+
+        t: [B, 1] explicit timestep. If None, recovered from realised mask
+        fraction via _t_from_input (inference fallback).
+        """
         if self._from_scratch:
             B, L = input_ids.shape
             positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
             x = self.embed_norm(self.token_embed(input_ids) + self.pos_embed(positions))
             cond_c = self.cond_proj(cond_embedding)
-            cond_t = self.t_embed(self._t_from_input(input_ids, padding_mask))
+            if t is None:
+                t = self._t_from_input(input_ids, padding_mask)
+            cond_t = self.t_embed(t)
             for block in self.blocks:
                 x = block(x, cond_c, cond_t, padding_mask)
-            x_normed, _ = self.final_norm(x, cond_c + cond_t)
+            x_normed, _ = self.final_norm(x, cond_c, cond_t)
             return x_normed
         hidden_states = self.token_embed(input_ids)
         hidden_states = self.embed_norm(hidden_states)
@@ -435,22 +445,24 @@ def apply_mask(token_ids, mask_token_id, padding_mask=None):
     """
     Apply random masking for MDLM training.
 
-    For each sample in batch, randomly choose a mask ratio in [0.1, 1.0],
-    then mask that fraction of non-padding tokens.
+    Sample t ~ Uniform[0, 1] per the paper, then derive mask_ratio from the
+    log-linear noise schedule. The training loop applies the 1/t weight floor
+    (clamp at min=0.02) on the *weight*, not on t itself, so the model still
+    sees the full t distribution in conditioning.
 
     Returns:
         masked_ids: [B, L] with some tokens replaced by mask_token_id
         target_mask: [B, L] boolean, True at positions that were masked (loss targets)
         mask_ratio: [B, 1] the mask ratio used for each sample
+        t: [B, 1] sampled timestep
     """
     B, L = token_ids.shape
     device = token_ids.device
 
     # Log-linear noise schedule: α_t = e^{-λt}, λ=5.0 (MDLM paper §3.2)
-    # t ~ Uniform[0,1], mask_ratio = 1 - e^{-5t}
-    # Clamp t at min=0.02 to cap loss weight 1/t ≤ 50 (stability)
-    t = torch.rand(B, 1, device=device).clamp(min=0.02)
-    mask_ratio = 1 - torch.exp(-5.0 * t)  # range [0.095, 0.993]
+    # t ~ Uniform[0, 1] (paper §4); mask_ratio = 1 - e^{-5t}
+    t = torch.rand(B, 1, device=device)
+    mask_ratio = 1 - torch.exp(-5.0 * t)
 
     # Random scores for each position
     rand_scores = torch.rand(B, L, device=device)

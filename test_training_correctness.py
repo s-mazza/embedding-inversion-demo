@@ -190,9 +190,11 @@ class TestAdaLNZero:
                 )
 
     def test_final_norm_proj_zero_at_init(self, small_model):
-        """final_norm (AdaLN) proj must also be zero-initialized."""
-        assert (small_model.final_norm.proj.weight == 0.0).all()
-        assert (small_model.final_norm.proj.bias == 0.0).all()
+        """final_norm (AdaLNZeroSplit) c_proj and t_proj must be zero-initialized."""
+        assert (small_model.final_norm.c_proj.weight == 0.0).all()
+        assert (small_model.final_norm.c_proj.bias == 0.0).all()
+        assert (small_model.final_norm.t_proj.weight == 0.0).all()
+        assert (small_model.final_norm.t_proj.bias == 0.0).all()
 
     def test_t_proj_zero_at_init(self, small_model):
         """Per-layer AdaLNZeroSplit t_proj weights must be zero-initialized (identity at init)."""
@@ -438,23 +440,22 @@ class TestMaskingCorrectness:
             )
 
     def test_apply_mask_mask_ratio_range(self):
-        """mask_ratio (from log-linear schedule) must be in [0.095, 0.993]."""
+        """mask_ratio (from log-linear schedule) must be in [0.0, 1.0]."""
         B, L = 1000, 16
         token_ids = torch.randint(0, 900, (B, L))
         _, _, mask_ratio, t = apply_mask(token_ids, mask_token_id=999)
 
-        # At t=0.02: mask_ratio = 1 - exp(-0.1) ≈ 0.0952
-        # At t=1.0: mask_ratio = 1 - exp(-5) ≈ 0.9933
-        assert mask_ratio.min().item() >= 0.08, f"mask_ratio below 0.08: {mask_ratio.min().item():.4f}"
+        # t ~ U[0,1] → mask_ratio = 1 - exp(-5t) ∈ [0, 1 - exp(-5)] ≈ [0, 0.9933]
+        assert mask_ratio.min().item() >= 0.0, f"mask_ratio below 0.0: {mask_ratio.min().item():.4f}"
         assert mask_ratio.max().item() <= 1.0, f"mask_ratio above 1.0: {mask_ratio.max().item():.4f}"
 
     def test_apply_mask_t_range(self):
-        """t must be in [0.02, 1.0] — clamped at min=0.02 for 1/t loss stability."""
+        """t must be in [0, 1] — paper §4 samples t uniformly from [0,1]."""
         B, L = 1000, 16
         token_ids = torch.randint(0, 900, (B, L))
         _, _, _, t = apply_mask(token_ids, mask_token_id=999)
-        assert t.min().item() >= 0.019, f"t < 0.02: {t.min().item()}"
-        assert t.max().item() <= 1.0, f"t > 1.0: {t.max().item()}"
+        assert t.min().item() >= 0.0, f"t < 0: {t.min().item()}"
+        assert t.max().item() <= 1.0, f"t > 1: {t.max().item()}"
 
     def test_apply_mask_formula_consistency(self):
         """mask_ratio must exactly equal 1 - exp(-5 * t)."""
@@ -927,28 +928,24 @@ class TestNoiseSchedule:
 
     def test_apply_mask_covers_full_range(self):
         """
-        Over 10000 samples, t should cover the full [0.02, 1.0] range.
+        Over 10000 samples, t should cover the full [0, 1] range.
         In particular, there should be samples near both boundaries.
         """
         B, L = 10000, 16
         token_ids = torch.zeros(B, L, dtype=torch.long)
         _, _, _, t = apply_mask(token_ids, mask_token_id=999)
 
-        assert t.min().item() < 0.05, f"No samples near t=0.02 boundary: min={t.min().item():.3f}"
-        assert t.max().item() > 0.95, f"No samples near t=1.0 boundary: max={t.max().item():.3f}"
+        assert t.min().item() < 0.05, f"No samples near t=0 boundary: min={t.min().item():.3f}"
+        assert t.max().item() > 0.95, f"No samples near t=1 boundary: max={t.max().item():.3f}"
 
     def test_t_uniform_distribution(self):
-        """t ~ U[0.02, 1.0]: mean should be ≈ 0.5002, std should be ≈ 0.28."""
+        """t ~ U[0, 1]: mean ≈ 0.5, std ≈ 1/sqrt(12) ≈ 0.2887."""
         B, L = 100000, 4
         token_ids = torch.zeros(B, L, dtype=torch.long)
         _, _, _, t = apply_mask(token_ids, mask_token_id=999)
 
-        # t = max(U(0, 1), 0.02)
-        # Expected mean = 0.02*0.02 + 0.5 * (1 - 0.02^2) = 0.0004 + 0.4998 = 0.5002
-        expected_mean = 0.5002
-        # Expected E[X^2] = 0.02^3 + (1 - 0.02^3)/3 ≈ 0.333338
-        # Variance = 0.333338 - 0.5002^2 ≈ 0.083138 -> std ≈ 0.2883
-        expected_std = 0.2883
+        expected_mean = 0.5
+        expected_std = 1.0 / math.sqrt(12.0)  # ≈ 0.2887
 
         assert abs(t.mean().item() - expected_mean) < 0.01, (
             f"t mean = {t.mean().item():.3f}, expected ≈ {expected_mean:.3f}"

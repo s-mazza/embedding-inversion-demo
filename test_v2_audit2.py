@@ -129,15 +129,18 @@ class TestIssue2TprojWeightDecay:
                     f"{name} should be in no_decay group (matched by 'adaln' substring)"
                 )
 
-    def test_t_embed_in_decay(self):
-        """t_embed.weight is a projection weight (not zero-init like adaln) and should be in decay."""
+    def test_t_embed_in_no_decay(self):
+        """Audit-3 fix: t_embed.weight should be in NO-decay group (image-DiT
+        convention — time-embedding weights are excluded from weight decay)."""
         model = ConditionalMDLM(_v2_config())
-        decay_names = [
+        no_decay_names = [
             name for name, param in model.named_parameters()
-            if param.requires_grad and not ("bias" in name or "norm" in name or "adaln" in name)
+            if param.requires_grad and (
+                "bias" in name or "norm" in name or "adaln" in name or "t_embed" in name
+            )
         ]
-        assert "t_embed.weight" in decay_names, (
-            "t_embed.weight should be in decay_params (it's a trainable projection)"
+        assert "t_embed.weight" in no_decay_names, (
+            "t_embed.weight should be in no_decay (image-DiT convention)."
         )
 
 
@@ -185,20 +188,22 @@ class TestIssue3EmbedNorm:
 
 class TestIssue4GradScalerDisabled:
 
-    def test_scaler_always_disabled(self):
-        """GradScaler must be created with enabled=False (BF16 needs no loss scaling)."""
+    def test_no_grad_scaler_in_loop(self):
+        """Audit-3 fix: GradScaler removed entirely (BF16 has fp32 range; scaling is a no-op)."""
         src = inspect.getsource(train.train)
-        assert "GradScaler('cuda', enabled=False)" in src, (
-            "GradScaler must use enabled=False for BF16 training. "
-            "BF16 has fp32 dynamic range — loss scaling provides no benefit and "
-            "introduces DDP asymmetric skip risk."
+        assert "GradScaler" not in src, (
+            "GradScaler must not appear in train(). BF16 has fp32 dynamic range — "
+            "loss scaling is a no-op and clutters the loop / checkpoint dict."
+        )
+        assert "scaler.scale" not in src and "scaler.step" not in src, (
+            "scaler.* call sites must be removed from the train loop."
         )
 
-    def test_scaler_not_enabled_by_use_amp(self):
-        """GradScaler must not use enabled=use_amp (always disabled, not config-dependent)."""
+    def test_optimizer_step_called_directly(self):
+        """optimizer.step() must be called directly (no scaler.step)."""
         src = inspect.getsource(train.train)
-        assert "GradScaler('cuda', enabled=use_amp)" not in src, (
-            "GradScaler must not be conditionally enabled via use_amp for BF16."
+        assert "optimizer.step()" in src, (
+            "optimizer.step() must be called directly after removing GradScaler."
         )
 
 
@@ -238,27 +243,28 @@ class TestIssue5EpochInCheckpoint:
 
 class TestIssue6FinalNormIsAdaLNZero:
 
-    def test_final_norm_is_adaln_zero(self):
-        """final_norm must be AdaLNZero (scale + shift + alpha gate)."""
+    def test_final_norm_is_adaln_zero_split(self):
+        """Audit-3 fix: final_norm uses AdaLNZeroSplit for per-layer t/c independence
+        (paper Eq. 6-9), matching the transformer blocks."""
         model = ConditionalMDLM(_v2_config())
-        assert isinstance(model.final_norm, AdaLNZero), (
-            f"final_norm is {type(model.final_norm).__name__}, expected AdaLNZero. "
-            "AdaLN (no gate) breaks identity-at-init in the output path."
+        assert isinstance(model.final_norm, AdaLNZeroSplit), (
+            f"final_norm is {type(model.final_norm).__name__}, expected AdaLNZeroSplit. "
+            "Single AdaLNZero with summed (cond_c+cond_t) breaks per-layer t/c split."
         )
 
-    def test_final_norm_proj_outputs_three_params(self):
-        """AdaLNZero.proj must output 3*hidden (scale + shift + alpha)."""
+    def test_final_norm_projs_output_three_params(self):
+        """AdaLNZeroSplit c_proj and t_proj each output 3*hidden (scale + shift + alpha)."""
         model = ConditionalMDLM(_v2_config())
-        assert model.final_norm.proj.out_features == 3 * model.hidden_dim, (
-            f"final_norm.proj outputs {model.final_norm.proj.out_features}, "
-            f"expected {3 * model.hidden_dim} (3 * hidden_dim for scale/shift/alpha)."
-        )
+        assert model.final_norm.c_proj.out_features == 3 * model.hidden_dim
+        assert model.final_norm.t_proj.out_features == 3 * model.hidden_dim
 
-    def test_final_norm_proj_zero_at_init(self):
-        """final_norm.proj must be zero-initialized (identity at init)."""
+    def test_final_norm_projs_zero_at_init(self):
+        """final_norm c_proj and t_proj must be zero-initialized (identity at init)."""
         model = ConditionalMDLM(_v2_config())
-        assert (model.final_norm.proj.weight == 0).all()
-        assert (model.final_norm.proj.bias == 0).all()
+        assert (model.final_norm.c_proj.weight == 0).all()
+        assert (model.final_norm.c_proj.bias == 0).all()
+        assert (model.final_norm.t_proj.weight == 0).all()
+        assert (model.final_norm.t_proj.bias == 0).all()
 
 
 # ---------------------------------------------------------------------------

@@ -93,15 +93,18 @@ def create_dataloaders(config, rank=0, world_size=1):
     tc = config["training"]
     mc = config["model"]
 
-    # Read pad/bos from meta.json if available, else use defaults
+    # Read pad_id from meta.json if available, else default to XLM-R's pad_id=1.
+    # bos_id is always None: prepare_data_fast.py uses add_special_tokens=False,
+    # so the data never contains BOS — masking it would only fire if a future
+    # encoder switch reintroduced special tokens.
     npy_dir = dc["data_dir"] + "_npy" if os.path.isdir(dc["data_dir"] + "_npy") else dc["data_dir"]
     meta_path = os.path.join(npy_dir, "meta.json")
-    pad_id, bos_id = 1, 0  # XLM-R defaults
+    pad_id = 1
+    bos_id = None
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
         pad_id = meta.get("pad_id", 1)
-        bos_id = None  # only XLM-R uses BOS=0
 
     train_ds = EmbeddingInversionDataset(
         dc["data_dir"], mc["max_seq_len"],

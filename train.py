@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from safetensors.torch import save_model as safetensors_save_model
 
@@ -55,52 +55,6 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr_ratio=0.0,
     return _cosine(step)
 
 
-def find_batch_size(config, model, device):
-    """Binary search for max batch size that fits in GPU memory."""
-    mc = config["model"]
-    low, high = 8, 2048
-    best = low
-
-    while low <= high:
-        mid = (low + high) // 2
-        try:
-            torch.cuda.empty_cache()
-            dummy_ids = torch.randint(0, mc["vocab_size"], (mid, mc["max_seq_len"]), device=device)
-            dummy_emb = torch.randn(mid, mc["embedding_cond_dim"], device=device)
-
-            with autocast('cuda', dtype=torch.bfloat16):
-                hidden = model.forward_hidden(dummy_ids, dummy_emb)
-                # Simulate exact chunked CE (same as training loop)
-                chunk_size = 256
-                h_flat = hidden.view(-1, hidden.shape[-1])
-                t_flat = dummy_ids.view(-1)
-                total_loss = torch.tensor(0.0, device=device)
-                w = model.output_proj.weight
-                for ci in range(0, h_flat.shape[0], chunk_size):
-                    ce = min(ci + chunk_size, h_flat.shape[0])
-                    lc = F.linear(h_flat[ci:ce], w)
-                    total_loss = total_loss + F.cross_entropy(lc, t_flat[ci:ce])
-                loss = total_loss / (h_flat.shape[0] / chunk_size)
-            loss.backward()
-            del hidden, h_flat, total_loss, loss
-            model.zero_grad()
-
-            best = mid
-            print(f"  batch_size={mid} OK", flush=True)
-            low = mid + 1
-        except torch.cuda.OutOfMemoryError:
-            print(f"  batch_size={mid} OOM", flush=True)
-            high = mid - 1
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  batch_size={mid} error: {e}", flush=True)
-            high = mid - 1
-
-    safe = max(32, int(best * 0.85))
-    print(f"Max batch size: {best}, using: {safe}", flush=True)
-    return safe
-
-
 def _meta(step, best_val_loss, config):
     """Build metadata dict for safetensors (all values must be strings)."""
     mc = config.get("model", {})
@@ -118,7 +72,7 @@ def _meta(step, best_val_loss, config):
     }
 
 
-def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, scaler, config, epoch=0):
+def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, optimizer, config, epoch=0):
     """Save full checkpoint for resuming training (.pt, includes optimizer state)."""
     tmp_path = path + ".tmp"
     torch.save({
@@ -129,7 +83,6 @@ def save_checkpoint(path, step, best_val_loss, best_step, model, ema_model, opti
         "model": model.state_dict(),
         "ema_model": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
         "config": config,
     }, tmp_path)
     os.replace(tmp_path, path)
@@ -197,7 +150,7 @@ def train(config, resume=False):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "bias" in name or "norm" in name or "adaln" in name:
+        if "bias" in name or "norm" in name or "adaln" in name or "t_embed" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -207,7 +160,6 @@ def train(config, resume=False):
         {'params': no_decay_params, 'weight_decay': 0.0}
     ], lr=tc["lr"])
     use_amp = tc.get("mixed_precision", True)
-    scaler = GradScaler('cuda', enabled=False)  # BF16 has fp32 dynamic range; scaling is a no-op
 
     # Gradient accumulation
     grad_accum = tc.get("grad_accum", 1)
@@ -236,7 +188,6 @@ def train(config, resume=False):
             clean_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in state_dict.items()}
             model.load_state_dict(clean_sd)
             optimizer.load_state_dict(ckpt["optimizer"])
-            scaler.load_state_dict(ckpt["scaler"])
             start_step = ckpt["step"]
             epoch = ckpt.get("epoch", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
@@ -313,8 +264,9 @@ def train(config, resume=False):
             optimizer.zero_grad(set_to_none=True)
 
         with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-            # Get hidden states instead of full logits to save memory
-            hidden = raw_model.forward_hidden(masked_ids, embedding, padding_mask)
+            # Pass t=t_sample so model conditions on the *actual* sampled t,
+            # not a noisy re-estimate from the realized mask fraction (paper §3.4).
+            hidden = raw_model.forward_hidden(masked_ids, embedding, padding_mask, t=t_sample)
 
             # Chunked cross-entropy — avoids materializing full [B*L, 250K] logit matrix
             B_micro = token_ids.shape[0]
@@ -329,8 +281,8 @@ def train(config, resume=False):
             # Accumulate CE sum per sample (flat pos j → sample j // L_seq)
             # Required for correct per-sample 1/t weighting (paper Eq. 4)
             sample_ce_sum = torch.zeros(B_micro, device=device)
-            total_correct = 0
-            total_masked = mask_flat.sum().item()
+            total_correct_t = torch.zeros((), device=device)
+            total_masked_t = mask_flat.sum()
 
             for i in range(0, total_positions, chunk_size):
                 end = min(i + chunk_size, total_positions)
@@ -348,18 +300,21 @@ def train(config, resume=False):
 
                 with torch.no_grad():
                     preds_chunk = logits_chunk.argmax(-1)
-                    total_correct += ((preds_chunk == t_chunk) * m_chunk.bool()).sum().item()
+                    total_correct_t += ((preds_chunk == t_chunk) * m_chunk.bool()).sum()
 
             # MDLM Eq 4: 1/t weights the sum of CE across masked positions for each sample.
-            # (Not the mean, which would incorrectly attenuate gradients when t ≈ 1)
-            loss = (sample_ce_sum / t_sample.squeeze(1)).mean()
+            # Clamp t at 0.02 to bound the weight at 1/t ≤ 50 (numerical stability) while
+            # still letting the model see the full t ∈ [0,1] range during noising.
+            loss = (sample_ce_sum / t_sample.clamp(min=0.02).squeeze(1)).mean()
             loss = loss / grad_accum  # scale for accumulation
 
         # no_sync skips all-reduce on non-final micro-steps (reduces NCCL overhead)
         sync_ctx = model.no_sync() if (is_dist and micro_step < grad_accum - 1) else contextlib.nullcontext()
         with sync_ctx:
-            scaler.scale(loss).backward()
+            loss.backward()
 
+        total_correct = total_correct_t.item()
+        total_masked = total_masked_t.item()
         running_loss += loss.item() * grad_accum
         running_acc += total_correct / max(total_masked, 1)
         running_count += 1
@@ -371,10 +326,8 @@ def train(config, resume=False):
 
         # Optimizer step after accumulation
         micro_step = 0
-        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(raw_model.parameters(), tc["max_grad_norm"])
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         # EMA update (ema_model is in fp32)
         with torch.no_grad():
             for ep, mp in zip(ema_model.parameters(), raw_model.parameters()):
@@ -397,114 +350,125 @@ def train(config, resume=False):
             running_acc = 0.0
             running_count = 0
 
-        # Validation & save best (rank 0 only)
-        if is_main and step % eval_every == 0:
-            ema_model.eval()
-            raw_model.eval()
-            val_loss = 0.0
-            val_count = 0
-            raw_val_loss = 0.0
-            raw_val_count = 0
-            with torch.no_grad(), torch.random.fork_rng():
-                torch.manual_seed(42)
-                for i, vb in enumerate(val_loader):
-                    if i >= 50:  # 50 batches = 10000 samples (batch_size=200)
-                        break
-                    vids = vb["token_ids"].to(device)
-                    vemb = vb["embedding"].to(device)
-                    vpad = vb["padding_mask"].to(device)
-                    vm_ids, vm_mask, _, _ = apply_mask(vids, mask_token_id, vpad)
+        # Validation & save best (rank 0 does the work; barriers keep rank 1
+        # from racing into the next all-reduce while rank 0 is in val — the
+        # mismatch would burn GPU 1 idle and risks a 30-min NCCL timeout).
+        if step % eval_every == 0:
+            if is_dist:
+                dist.barrier()
+            should_stop = torch.zeros(1, dtype=torch.int, device=device)
+            if is_main:
+                ema_model.eval()
+                raw_model.eval()
+                val_loss = 0.0
+                val_count = 0
+                raw_val_loss = 0.0
+                raw_val_count = 0
+                with torch.no_grad(), torch.random.fork_rng():
+                    torch.manual_seed(42)
+                    for i, vb in enumerate(val_loader):
+                        if i >= 50:  # 50 batches = 10000 samples (batch_size=200)
+                            break
+                        vids = vb["token_ids"].to(device)
+                        vemb = vb["embedding"].to(device)
+                        vpad = vb["padding_mask"].to(device)
+                        vm_ids, vm_mask, _, _ = apply_mask(vids, mask_token_id, vpad)
 
-                    with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-                        vhidden = ema_model.forward_hidden(vm_ids, vemb, vpad)
-                        vh_flat = vhidden.view(-1, vhidden.shape[-1])
-                        vt_flat = vids.view(-1)
-                        vm_flat = vm_mask.view(-1).float()
-                        vw = ema_model.output_proj.weight
-                        vtotal = torch.tensor(0.0, device=device)
-                        for vi in range(0, vh_flat.shape[0], 256):
-                            ve = min(vi + 256, vh_flat.shape[0])
-                            vlc = F.linear(vh_flat[vi:ve], vw)
-                            vtotal = vtotal + (F.cross_entropy(vlc, vt_flat[vi:ve], reduction="none") * vm_flat[vi:ve]).sum()
-                        vloss = vtotal / vm_flat.sum().clamp(min=1)
-
-                    val_loss += vloss.item()
-                    val_count += 1
-
-                    # Raw model val (first 10 batches only — quick progress signal)
-                    if i < 10:
                         with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-                            rv_hidden = raw_model.forward_hidden(vm_ids, vemb, vpad)
-                            rv_flat = rv_hidden.view(-1, rv_hidden.shape[-1])
-                            rw = raw_model.output_proj.weight
-                            rtotal = torch.tensor(0.0, device=device)
-                            for vi in range(0, rv_flat.shape[0], 256):
-                                ve = min(vi + 256, rv_flat.shape[0])
-                                rlc = F.linear(rv_flat[vi:ve], rw)
-                                rtotal = rtotal + (F.cross_entropy(rlc, vt_flat[vi:ve], reduction="none") * vm_flat[vi:ve]).sum()
-                            rvloss = rtotal / vm_flat.sum().clamp(min=1)
-                        raw_val_loss += rvloss.item()
-                        raw_val_count += 1
+                            vhidden = ema_model.forward_hidden(vm_ids, vemb, vpad)
+                            vh_flat = vhidden.view(-1, vhidden.shape[-1])
+                            vt_flat = vids.view(-1)
+                            vm_flat = vm_mask.view(-1).float()
+                            vw = ema_model.output_proj.weight
+                            vtotal = torch.tensor(0.0, device=device)
+                            for vi in range(0, vh_flat.shape[0], 256):
+                                ve = min(vi + 256, vh_flat.shape[0])
+                                vlc = F.linear(vh_flat[vi:ve], vw)
+                                vtotal = vtotal + (F.cross_entropy(vlc, vt_flat[vi:ve], reduction="none") * vm_flat[vi:ve]).sum()
+                            vloss = vtotal / vm_flat.sum().clamp(min=1)
 
-            avg_val = val_loss / max(val_count, 1)
-            avg_raw_val = raw_val_loss / max(raw_val_count, 1)
-            improved = " [BEST]" if avg_val < best_val_loss else ""
-            print(f"  val_loss (ema): {avg_val:.4f} | val_loss (raw): {avg_raw_val:.4f}{improved}", flush=True)
+                        val_loss += vloss.item()
+                        val_count += 1
 
-            # EMA token accuracy at 100% masking (paper Table 1 metric: 76.0% @ step 62500)
-            with torch.no_grad():
-                full_mask_correct, full_mask_total = 0, 0
-                for vi2, vb2 in enumerate(val_loader):
-                    if vi2 >= 10:
-                        break
-                    vids2 = vb2["token_ids"].to(device)
-                    vemb2 = vb2["embedding"].to(device)
-                    vpad2 = vb2["padding_mask"].to(device)
-                    vmask = ~vpad2
-                    vids_masked = vids2.clone()
-                    vids_masked[vmask] = mask_token_id
-                    with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-                        vh2 = ema_model.forward_hidden(vids_masked, vemb2, vpad2)
-                        vlogits2 = F.linear(vh2, ema_model.output_proj.weight)
-                    preds2 = vlogits2.argmax(-1)
-                    full_mask_correct += ((preds2 == vids2) & vmask).sum().item()
-                    full_mask_total   += vmask.sum().item()
-            token_acc = full_mask_correct / max(full_mask_total, 1)
-            print(f"  token_acc (EMA, 100% mask): {token_acc:.3f}  [paper target: 0.760 @ step 62500]", flush=True)
+                        # Raw model val (first 10 batches only — quick progress signal)
+                        if i < 10:
+                            with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                                rv_hidden = raw_model.forward_hidden(vm_ids, vemb, vpad)
+                                rv_flat = rv_hidden.view(-1, rv_hidden.shape[-1])
+                                rw = raw_model.output_proj.weight
+                                rtotal = torch.tensor(0.0, device=device)
+                                for vi in range(0, rv_flat.shape[0], 256):
+                                    ve = min(vi + 256, rv_flat.shape[0])
+                                    rlc = F.linear(rv_flat[vi:ve], rw)
+                                    rtotal = rtotal + (F.cross_entropy(rlc, vt_flat[vi:ve], reduction="none") * vm_flat[vi:ve]).sum()
+                                rvloss = rtotal / vm_flat.sum().clamp(min=1)
+                            raw_val_loss += rvloss.item()
+                            raw_val_count += 1
 
-            if avg_val < best_val_loss:
-                best_val_loss = avg_val
-                best_step = step
-                save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
-                save_ema(f"{ckpt_dir}/best_ema.pt", step, best_val_loss, ema_model, config)
-                print(f"  Saved best.pt + best_ema.pt (step {step}, val_loss {avg_val:.4f})", flush=True)
+                avg_val = val_loss / max(val_count, 1)
+                avg_raw_val = raw_val_loss / max(raw_val_count, 1)
+                improved = " [BEST]" if avg_val < best_val_loss else ""
+                print(f"  val_loss (ema): {avg_val:.4f} | val_loss (raw): {avg_raw_val:.4f}{improved}", flush=True)
 
-            # Early stopping check
-            if step - best_step >= early_stop_patience and step > early_stop_patience:
-                print(f"\n=== Early stopping: no improvement for {step - best_step} steps (patience={early_stop_patience}) ===", flush=True)
-                save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
-                save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
-                print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
-                if is_dist:
-                    dist.destroy_process_group()
-                return
+                # EMA token accuracy at 100% masking (paper Table 1 metric: 76.0% @ step 62500)
+                with torch.no_grad():
+                    full_mask_correct, full_mask_total = 0, 0
+                    for vi2, vb2 in enumerate(val_loader):
+                        if vi2 >= 10:
+                            break
+                        vids2 = vb2["token_ids"].to(device)
+                        vemb2 = vb2["embedding"].to(device)
+                        vpad2 = vb2["padding_mask"].to(device)
+                        vmask = ~vpad2
+                        vids_masked = vids2.clone()
+                        vids_masked[vmask] = mask_token_id
+                        with autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                            vh2 = ema_model.forward_hidden(vids_masked, vemb2, vpad2)
+                            vlogits2 = F.linear(vh2, ema_model.output_proj.weight)
+                        preds2 = vlogits2.argmax(-1)
+                        full_mask_correct += ((preds2 == vids2) & vmask).sum().item()
+                        full_mask_total   += vmask.sum().item()
+                token_acc = full_mask_correct / max(full_mask_total, 1)
+                print(f"  token_acc (EMA, 100% mask): {token_acc:.3f}  [paper target: 0.760 @ step 62500]", flush=True)
 
-            # Save latest for resume
-            save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
+                if avg_val < best_val_loss:
+                    best_val_loss = avg_val
+                    best_step = step
+                    save_checkpoint(f"{ckpt_dir}/best.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, config, epoch=epoch)
+                    save_ema(f"{ckpt_dir}/best_ema.pt", step, best_val_loss, ema_model, config)
+                    print(f"  Saved best.pt + best_ema.pt (step {step}, val_loss {avg_val:.4f})", flush=True)
 
-            # Save milestone checkpoints for paper experiments
-            milestones = {10000, 25000, 50000, 100000, 200000}
-            if step in milestones:
-                mpath = f"{ckpt_dir}/step_{step}.pt"
-                save_checkpoint(mpath, step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
-                save_ema(f"{ckpt_dir}/step_{step}_ema.pt", step, best_val_loss, ema_model, config)
-                print(f"  Saved milestone: {mpath} + ema", flush=True)
+                # Early stopping check — signal all ranks via broadcast below;
+                # rank 0 cannot just `return` here, that would deadlock rank 1.
+                if step - best_step >= early_stop_patience and step > early_stop_patience:
+                    print(f"\n=== Early stopping: no improvement for {step - best_step} steps (patience={early_stop_patience}) ===", flush=True)
+                    save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, config, epoch=epoch)
+                    save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
+                    print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
+                    should_stop[0] = 1
 
-            model.train()
+                # Save latest for resume
+                save_checkpoint(f"{ckpt_dir}/latest.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, config, epoch=epoch)
+
+                # Save milestone checkpoints for paper experiments
+                milestones = {10000, 25000, 50000, 100000, 200000}
+                if step in milestones:
+                    mpath = f"{ckpt_dir}/step_{step}.pt"
+                    save_checkpoint(mpath, step, best_val_loss, best_step, raw_model, ema_model, optimizer, config, epoch=epoch)
+                    save_ema(f"{ckpt_dir}/step_{step}_ema.pt", step, best_val_loss, ema_model, config)
+                    print(f"  Saved milestone: {mpath} + ema", flush=True)
+
+                model.train()
+
+            if is_dist:
+                dist.broadcast(should_stop, src=0)
+                dist.barrier()
+            if should_stop.item():
+                break
 
     if is_main:
         print(f"\n=== Training complete ({step} steps) ===", flush=True)
-        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, scaler, config, epoch=epoch)
+        save_checkpoint(f"{ckpt_dir}/final.pt", step, best_val_loss, best_step, raw_model, ema_model, optimizer, config, epoch=epoch)
         save_ema(f"{ckpt_dir}/final_ema.pt", step, best_val_loss, ema_model, config)
         print(f"Saved final.pt + final_ema.pt (best val_loss: {best_val_loss:.4f} at step {best_step})", flush=True)
 
